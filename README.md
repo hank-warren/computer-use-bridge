@@ -150,6 +150,7 @@ the allowlist.
 | `tunnels` | Reverse SSH tunnels, e.g. `[{"ssh": "devvm", "remotePort": 47801}]`. See [Remote machines over SSH](#remote-machines-over-ssh). |
 | `screenshotMaxWidth` | Downscale screenshots to this width (default 1280; 0 keeps full size). |
 | `tabEval` | `false` removes the `eval_tab` tool. |
+| `treeMaxChars` | Cap on the accessibility tree in each result (default 20000; 0 for no limit). See [Result size](#result-size). |
 
 After editing it by hand, run `brew services restart computer-use-bridge`.
 Find an app's bundle ID with `osascript -e 'id of app "Brave Browser"'`.
@@ -247,6 +248,19 @@ config, nothing about SSH runs.
 The bound window may also be the one you are using, so agent input and yours
 can interleave.
 
+### Result size
+
+The tree of a big page or app runs to hundreds of thousands of characters (a
+Wikipedia article is about 200,000), which would fill an agent's context in a
+few calls. Every result keeps only the first `treeMaxChars` characters of each
+tree (default 20,000) and says how much it left out. Element numbers in the
+part shown stay valid. For more, call `get_state` with `max_chars` (0 for the
+whole tree); for page content, `read_tab` and `tab_locator` are more precise.
+
+Clients that call tools from code (pi's codemode, for example) can filter
+large results before they reach the model, which is how ChatGPT itself uses
+the engine; the cap protects clients that pass results straight through.
+
 Screenshots are downscaled to `max_width` (default 1280) with `sips` before
 they leave the Mac. Coordinates a client sends back refer to the image it
 received; the bridge maps them to the window.
@@ -270,11 +284,13 @@ ChatGPT's browser extension connected), work on tabs instead of the window:
 
 How tabs are handled, and why:
 
-- `open_tab` opens the tab natively (Cmd+T in the front window) and then
-  attaches to it, because tabs created through the browser API always land
-  in a "ChatGPT" tab group. The new tab becomes the active tab. It refreshes
-  the window's state first, because the engine refuses input to a window that
-  changed since it last looked (e.g. after you used the browser).
+- `open_tab` uses the engine's own `createBrowserTab`, as ChatGPT does, so
+  agent tabs land in a "🤖 Agent" tab group. Opening with Cmd+T and attaching
+  to the browser's new-tab page sometimes hung for 20 s or left the tab with
+  a dead debugger.
+- The first browser call after an engine starts can take 10-20 s while the
+  engine connects to the browser extension; after that, `open_tab` takes
+  under a second.
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
   and retries the call once. A batch is only retried if nothing in it ran yet.
 - A tab attached by one session is locked to it until that session's engine

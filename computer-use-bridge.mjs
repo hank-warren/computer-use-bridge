@@ -25,7 +25,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const PLUGIN_DIR = join(homedir(), ".codex/plugins/cache/openai-bundled/unified-computer-use");
 const NAME = "computer-use-bridge";
@@ -269,6 +269,8 @@ const FAIL = "[[cub-failed]]";
 // Every call writes this, so the bridge can tell its own output from cua_repl's.
 const MARK = "[[cub-out]]";
 const DEFAULT_MAX_WIDTH = 1280;
+const DEFAULT_TREE_MAX = 20_000;
+const TAB_GROUP = "🤖 Agent";
 
 const appProp = { type: "string", description: "Bundle ID (e.g. com.brave.Browser) or app name; must be an allowed app." };
 const tabProp = { type: "string", description: "Browser tab ID from list_tabs or open_tab. Give tab instead of app to act inside that tab." };
@@ -359,7 +361,10 @@ const TOOL_DEFS = [
     name: "get_state",
     readOnly: true,
     description: "Return the accessibility tree of an app's frontmost window (binding it on the first call, or again with rebind=true after the user switches windows) or of a browser tab. Later calls return a diff unless full=true.",
-    props: { app: appProp, tab: tabProp, full: { type: "boolean" }, rebind: { type: "boolean" }, screenshot: { type: "boolean" }, max_width: maxWidthProp },
+    props: {
+      app: appProp, tab: tabProp, full: { type: "boolean" }, rebind: { type: "boolean" }, screenshot: { type: "boolean" }, max_width: maxWidthProp,
+      max_chars: { type: "integer", minimum: 0, description: `Return at most this many characters of the tree (default ${DEFAULT_TREE_MAX} unless the server sets treeMaxChars; 0 for no limit). Other tools always use the server's limit.` },
+    },
   },
   { name: "screenshot", readOnly: true, description: "Screenshot of the app's bound window or of a browser tab.", props: { app: appProp, tab: tabProp, max_width: maxWidthProp } },
   ...Object.entries(ACTIONS).map(([name, d]) => ({
@@ -387,7 +392,7 @@ const TOOL_DEFS = [
   },
   {
     name: "open_tab",
-    description: "Open a URL in a new ordinary tab (no tab group) and return its tab ID and tree.",
+    description: `Open a URL in a new tab (in the browser's "${TAB_GROUP}" tab group) and return its tab ID and tree.`,
     props: { url: { type: "string" }, browser: { type: "string", description: "Browser app (bundle ID or name); default: the first allowed browser that is running." } },
     required: ["url"],
   },
@@ -779,6 +784,15 @@ if (fresh) {
     return { isTab: false, key: `app:${id}`, bind: Session.bindApp(J(id), a.rebind) };
   }
 
+  // Trees of big pages run to hundreds of thousands of characters; results keep the
+  // top of each so they fit an agent's context. read_tab and eval_tab have their own limit.
+  treeCap(name, a) {
+    if (name === "read_tab" || name === "eval_tab") return 0;
+    const n = name === "get_state" && a.max_chars !== undefined ? a.max_chars : this.cfg.treeMaxChars ?? DEFAULT_TREE_MAX;
+    if (!Number.isInteger(n) || n < 0) throw new BadInput("max_chars must be a non-negative integer");
+    return n;
+  }
+
   maxWidth(a) {
     const w = a.max_width ?? this.cfg.screenshotMaxWidth ?? DEFAULT_MAX_WIDTH;
     if (!Number.isInteger(w) || w < 0 || w > 4000) throw new BadInput("max_width must be an integer from 0 to 4000");
@@ -803,9 +817,16 @@ if (fresh) {
   async callFixedOnce(name, a) {
     if (!this.tools.some((t) => t.name === name)) throw new BadInput(`unknown tool ${name}`);
     const maxWidth = this.maxWidth(a);
+    const cap = this.treeCap(name, a);
     // Screenshots are downscaled here; the factor maps the client's coordinates back.
     const run = async (body, t, timeoutMs, { trim = false } = {}) => {
       const res = await this.js(`${prelude(t ? (this.scales.get(t.key) ?? 1) : 1)}\n${body}`, timeoutMs, { trim });
+      for (const c of res.content) {
+        if (!cap || c.type !== "text" || c.text.length <= cap) continue;
+        const cut = c.text.lastIndexOf("\n", cap) > cap * 0.8 ? c.text.lastIndexOf("\n", cap) : cap;
+        const more = t?.isTab ? "; for page content use read_tab or tab_locator" : "";
+        c.text = `${c.text.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${c.text.length} characters. Elements after this point exist but are not listed. Use get_state with a larger max_chars to see them${more}.]`;
+      }
       for (const [i, c] of [...res.content.entries()]) {
         if (c.type !== "image") continue;
         const scaled = await scaleImage(c, maxWidth);
@@ -882,28 +903,13 @@ nodeRepl.write(JSON.stringify(__out.slice(0, ${Math.min(limit, 200)}), null, 1) 
       case "open_tab": {
         const url = httpUrl(a.url);
         const fams = await this.browserFamilies(a.browser);
-        // Opened natively (Cmd+T) then attached, because tabs created through the
-        // browser API land in a "ChatGPT" tab group.
+        // The engine's own way to open a tab, as ChatGPT does; its tabs land in a named tab
+        // group. Opening with Cmd+T and attaching to the new-tab page hung or detached.
         return run(`const __b = (await cua.listBrowsers({ emit: false })).find((b) => !${J(fams)} || ${J(fams)}.includes(b.family));
 if (!__b) throw new Error("no allowed browser is running with the ChatGPT extension connected");
-const __apps = ${J(BROWSER_APPS)};
-if (!__apps[__b.family]) throw new Error("unsupported browser family " + __b.family);
-${Session.bindApp("__apps[__b.family]", false)}
-// The engine refuses input to a window that changed since its last look, e.g. after the user used the browser.
-if (!fresh) await tgt.getAXState({ emit: false });
-const __browser = await agent.browsers.get(__b.id);
-const __before = new Set((await __browser.user.openTabs()).map((t) => t.id));
-await tgt.pressKey("super+t");
-let __new;
-for (let i = 0; i < 40 && !__new; i++) {
-  await new Promise((r) => setTimeout(r, 250));
-  __new = (await __browser.user.openTabs()).find((t) => !__before.has(t.id));
-}
-if (!__new) throw new Error("the new tab did not appear");
-const __tab = await cua.getTab(__new.id, { browser: __b.id });
-__C.tabs[__new.id] = __tab;
-await __tab.goto(${J(url)});
-nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
+const __tab = await cua.createBrowserTab(__b.family, ${J(url)}, { sessionName: ${J(TAB_GROUP)}, emit: false });
+__C.tabs[__tab.id] = __tab;
+nodeRepl.write("Opened tab " + __tab.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
       }
       case "navigate_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
