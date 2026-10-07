@@ -268,6 +268,8 @@ const BROWSER_APPS = {
 const FAIL = "[[cub-failed]]";
 // Every call writes this, so the bridge can tell its own output from cua_repl's.
 const MARK = "[[cub-out]]";
+// Written once an action has had an effect, so a failed call is not replayed.
+const RAN = "[[cub-ran]]";
 const DEFAULT_MAX_WIDTH = 1280;
 const DEFAULT_TREE_MAX = 20_000;
 
@@ -362,7 +364,7 @@ const TOOL_DEFS = [
     description: "Return the accessibility tree of an app's frontmost window (binding it on the first call, or again with rebind=true after the user switches windows) or of a browser tab. Later calls return a diff unless full=true.",
     props: {
       app: appProp, tab: tabProp, full: { type: "boolean" }, rebind: { type: "boolean" }, screenshot: { type: "boolean" }, max_width: maxWidthProp,
-      max_chars: { type: "integer", minimum: 0, description: `Return at most this many characters of the tree (default ${DEFAULT_TREE_MAX} unless the server sets treeMaxChars; 0 for no limit). Other tools always use the server's limit.` },
+      max_chars: { type: "integer", minimum: 0, description: `Return at most this many characters of the tree (default ${DEFAULT_TREE_MAX} unless the server sets treeMaxChars; 0 for no limit). With full: true it returns the whole tree rather than a diff. Other tools always use the server's limit.` },
     },
   },
   { name: "screenshot", readOnly: true, description: "Screenshot of the app's bound window or of a browser tab.", props: { app: appProp, tab: tabProp, max_width: maxWidthProp } },
@@ -537,7 +539,7 @@ function locatorJs(a) {
     case "check": return { code: `await ${loc}.check(${J(t)});` };
     case "uncheck": return { code: `await ${loc}.uncheck(${J(t)});` };
     case "select_option": return { code: `await ${loc}.selectOption(${value()}, ${J(t)});` };
-    case "text": return { code: `nodeRepl.write(await ${loc}.innerText(${J(t)}));`, read: true };
+    case "text": return { code: `nodeRepl.write(__trunc(await ${loc}.innerText(${J(t)}), 20000));`, read: true };
     case "count": return { code: `nodeRepl.write(String(await ${loc}.count()));`, read: true };
     default: throw new BadInput("action must be click, dblclick, fill, type, press, check, uncheck, select_option, text or count");
   }
@@ -687,22 +689,27 @@ class Session {
     // A block keeps generated bindings out of the persistent REPL scope.
     const res = await (await this.cua()).call("js", { code: `{\n${code}\n}`, timeout_ms: timeoutMs }, timeoutMs + 30_000);
     let failed = !!res.isError;
+    let ran = false;
     const content = [];
     for (const [i, c] of (res.content ?? []).entries()) {
       if (c.type !== "text") { content.push(c); continue; }
       // Drop cua_repl's first-use API docs; fixed-surface clients cannot use them.
       if (/^(## Computer Use|# Other Browser APIs)/.test(c.text)) continue;
       if (trim && !c.text.includes(MARK) && !(res.isError && i === 0)) continue;
-      let text = c.text.replaceAll(MARK, "");
+      // error: the thrown message; out: the bridge's own writes; state: a tree cua_repl displayed.
+      const kind = res.isError && i === 0 ? "error" : c.text.includes(MARK) ? "out" : "state";
+      if (c.text.includes(RAN)) ran = true;
+      let text = c.text.replaceAll(MARK, "").replaceAll(RAN, "");
       if (text.includes(FAIL)) {
         failed = true;
         text = text.replaceAll(FAIL, "");
       }
       // E.g. a password manager's inline autofill menu; tab automation stays blocked until it closes.
       if (/another extension UI is open/.test(text)) text += "\nDismiss it with press_key (key Escape) on the browser app, not the tab, then retry.";
-      if (text.trim()) content.push({ ...c, text });
+      if (text.trim()) content.push(Object.defineProperty({ ...c, text }, "kind", { value: kind }));
     }
-    return { content: content.length ? content : [{ type: "text", text: "ok" }], isError: failed };
+    const out = { content: content.length ? content : [{ type: "text", text: "ok" }], isError: failed };
+    return Object.defineProperty(out, "ran", { value: ran });
   }
 
   async resolveApp(app) {
@@ -798,28 +805,39 @@ if (fresh) {
     return w;
   }
 
-  // A tab whose debugger detached stays broken under its cached handle, so re-attach
-  // and retry once. Batches only retry when nothing ran yet (stopped at step 1).
+  // A tab whose debugger detached stays broken under its cached handle: re-attach it, and
+  // if that fails too, restart the engine (a new engine attaches the same tab fine). A call
+  // is replayed only if none of its actions ran and it names no element numbers, which
+  // belong to the old attachment; otherwise the caller gets the tab's fresh tree instead.
   async callFixed(name, a) {
+    const detached = (r) => r.isError && /Debugger (unattached|detached|is not attached)/i.test(r.content.map((c) => c.text ?? "").join("\n"));
+    const say = (r, text) => { r.content.unshift({ type: "text", text }); return r; };
+    const ranNote = "Your action ran, but the tab's debugger detached before the bridge could read the tree back. Do not repeat the action; call get_state on the tab, which re-attaches it, to see the result.";
     const res = await this.callFixedOnce(name, a);
-    const text = res.isError && a.tab !== undefined ? res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") : "";
-    if (!/Debugger (unattached|detached|is not attached)/i.test(text)) return res;
-    if (name === "batch" && /Batch stopped at step (?!1 )\d+/.test(text)) return res;
-    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching and retrying ${name}`);
-    let again = await this.callFixedOnce(name, { ...a, rebind: true });
-    const stuck = (r) => r.isError && /Debugger (unattached|detached|is not attached)/i.test(r.content.map((c) => c.text ?? "").join("\n"));
-    // The dead attachment belongs to this engine; a new engine attaches the same tab fine.
-    if (stuck(again)) {
+    if (a.tab === undefined || !detached(res)) return res;
+    if (res.ran) return say(res, ranNote);
+    const elements = name === "batch"
+      ? Array.isArray(a.actions) && a.actions.some((s) => s?.element !== undefined)
+      : a.element !== undefined;
+    const attempt = (rebind) => (elements
+      ? this.callFixedOnce("get_state", { tab: a.tab, full: true, rebind })
+      : this.callFixedOnce(name, { ...a, rebind }));
+    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching${elements ? "" : ` and retrying ${name}`}`);
+    let again = await attempt(true);
+    let restarted = false;
+    if (detached(again) && !again.ran) {
       await this.stopEngine("tab debugger stuck");
-      again = await this.callFixedOnce(name, a);
+      again = await attempt(false);
       this.notice = null;
-      again.content.unshift({ type: "text", text: stuck(again)
-        ? "The tab's debugger had detached and even a new engine could not re-attach it; open the page in a new tab with open_tab."
-        : "The tab's debugger had detached; the bridge restarted the engine and retried. Other tabs and windows of this session were re-attached, so call get_state before using their element numbers." });
-      return again;
+      restarted = true;
     }
-    again.content.unshift({ type: "text", text: "The tab's debugger had detached; the bridge re-attached it and retried." });
-    return again;
+    if (again.ran && detached(again)) return say(again, ranNote);
+    if (detached(again)) return say(again, "The tab's debugger had detached and even a new engine could not re-attach it; open the page in a new tab with open_tab.");
+    const how = restarted ? "the bridge restarted the engine to re-attach it" : "the bridge re-attached it";
+    const others = restarted ? " Other tabs and windows of this session were re-attached too, so call get_state before using their element numbers." : "";
+    if (!elements) return say(again, `The tab's debugger had detached; ${how} and retried.${others}`);
+    again.isError = true;
+    return say(again, `The tab's debugger had detached; ${how}. Your ${name} did NOT run, because its element numbers belonged to the old attachment. The tab's current tree follows; choose elements from it and call ${name} again.${others}`);
   }
 
   async callFixedOnce(name, a) {
@@ -829,11 +847,14 @@ if (fresh) {
     // Screenshots are downscaled here; the factor maps the client's coordinates back.
     const run = async (body, t, timeoutMs, { trim = false } = {}) => {
       const res = await this.js(`${prelude(t ? (this.scales.get(t.key) ?? 1) : 1)}\n${body}`, timeoutMs, { trim });
+      // Only trees are capped: cua_repl's displayed states, and open_tab's own write of one.
       for (const c of res.content) {
         if (!cap || c.type !== "text" || c.text.length <= cap) continue;
-        const cut = c.text.lastIndexOf("\n", cap) > cap * 0.8 ? c.text.lastIndexOf("\n", cap) : cap;
+        if (c.kind !== "state" && !(c.kind === "out" && name === "open_tab")) continue;
+        let cut = c.text.lastIndexOf("\n", cap);
+        if (cut < cap * 0.8) cut = /[\uD800-\uDBFF]/.test(c.text[cap - 1]) ? cap - 1 : cap;
         const more = t?.isTab || name === "open_tab" ? "; for page content use read_tab or tab_locator" : "";
-        c.text = `${c.text.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${c.text.length} characters. Elements after this point exist but are not listed. Use get_state with a larger max_chars to see them${more}.]`;
+        c.text = `${c.text.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${c.text.length} characters. Elements after this point exist but are not listed. To see them, call get_state with full: true and a larger max_chars (0 for no limit)${more}.]`;
       }
       for (const [i, c] of [...res.content.entries()]) {
         if (c.type !== "image") continue;
@@ -881,7 +902,7 @@ ${shot}`, t);
           if (action !== "wait" && !ACTIONS[action]) throw new BadInput(`step ${i + 1}: unknown action ${action}`);
           const params = action === "secondary_action" ? { ...rest, action: actionName } : rest;
           try {
-            return `__step = ${i + 1}; __what = ${J(action)};\n${actionJs(action, params, t.isTab)}`;
+            return `__step = ${i + 1}; __what = ${J(action)};\n${actionJs(action, params, t.isTab)}${action === "wait" ? "" : `\nnodeRepl.write(${J(RAN)});`}`;
           } catch (e) {
             throw e instanceof BadInput ? new BadInput(`step ${i + 1} (${action}): ${e.message}`) : e;
           }
@@ -930,24 +951,33 @@ for (let i = 0; i < 100 && !__new; i++) {
   __new = (await __browser.user.openTabs()).find((t) => !__before.has(t.id));
 }
 if (!__new) throw new Error("the new tab did not appear");
-// The new tab changed the window; look again so the engine accepts the next keys.
-const __type = async () => {
+// The new tab changed the window, so look again before typing (the engine refuses keys to a
+// changed window). Type only while the new tab is still the focused one: openTabs lists the
+// most recently focused tab first, and the user may have switched tabs meanwhile.
+let __start;
+for (let __try = 1; ; __try++) {
   await tgt.getAXState({ emit: false });
-  await tgt.pressKey("super+l");
-  await tgt.paste(${J(url)}, { format: "text" });
-  await tgt.pressKey("Return");
-};
-try { await __type(); } catch (e) {
-  if (!/changed/i.test(e.message)) throw e;
-  await new Promise((r) => setTimeout(r, 300));
-  await __type();
+  const __now = await __browser.user.openTabs();
+  if (__now[0]?.id !== __new.id) throw new Error("another tab was focused while new tab " + __new.id + " was opening, so the URL was not typed and that empty tab was left open; retry open_tab");
+  __start ??= __now[0].url ?? "";
+  try {
+    await tgt.pressKey("super+l");
+    await tgt.paste(${J(url)}, { format: "text" });
+    await tgt.pressKey("Return");
+    break;
+  } catch (e) {
+    if (__try >= 2 || !/changed/i.test(e.message)) throw e;
+    await new Promise((r) => setTimeout(r, 300));
+  }
 }
+// Done once the tab left its starting page (which may itself be an http(s) homepage).
+const __went = (u) => /^https?:/.test(u) && (u !== __start || u === ${J(url)});
 let __url = "";
-for (let i = 0; i < 150 && !/^https?:/.test(__url); i++) {
+for (let i = 0; i < 150 && !__went(__url); i++) {
   await new Promise((r) => setTimeout(r, 100));
   __url = (await __browser.user.openTabs()).find((t) => t.id === __new.id)?.url ?? "";
 }
-if (!/^https?:/.test(__url)) throw new Error("the new tab did not navigate to " + ${J(url)} + " (it is at " + (__url || "an unknown page") + ")");
+if (!__went(__url)) throw new Error("the new tab did not navigate to " + ${J(url)} + " (it is at " + (__url || "an unknown page") + ")");
 const __tab = await cua.getTab(__new.id, { browser: __b.id });
 __C.tabs[__new.id] = __tab;
 nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
@@ -958,11 +988,11 @@ nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __t
         if (a.action === "goto") call = `await tgt.goto(${J(httpUrl(a.url))});`;
         else if (["back", "forward", "reload"].includes(a.action)) call = `await tgt.${a.action}();`;
         else throw new BadInput("action must be goto, back, forward or reload");
-        return run(`${t.bind}\n${call}\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
+        return run(`${t.bind}\n${call}\nnodeRepl.write(${J(RAN)});\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
       }
       case "close_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
-        return run(`${t.bind}\nawait tgt.close();\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
+        return run(`${t.bind}\nawait tgt.close();\nnodeRepl.write(${J(RAN)});\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
       }
       case "read_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
@@ -979,16 +1009,17 @@ nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __t
         const max = a.max_chars === undefined ? 20_000 : int(a.max_chars, "max_chars");
         return run(`${t.bind}
 const __r = await tgt.playwright.evaluate(${J(str(a.expression, "expression", 20_000))});
+nodeRepl.write(${J(RAN)});
 nodeRepl.write(__trunc(__r === undefined ? "undefined" : JSON.stringify(__r, null, 1) ?? String(__r), ${max}));`, t, undefined, { trim: true });
       }
       case "tab_locator": {
         const t = await this.bindTarget(a, { tabOnly: true });
         const { code, read } = locatorJs(a);
-        return run(`${t.bind}\nconst pw = tgt.playwright;\n${code}\n${read ? "" : "await tgt.getAXState();"}`, t, undefined, { trim: !!read });
+        return run(`${t.bind}\nconst pw = tgt.playwright;\n${code}\n${read ? "" : `nodeRepl.write(${J(RAN)});\nawait tgt.getAXState();`}`, t, undefined, { trim: !!read });
       }
       default: {
         const t = await this.bindTarget(a);
-        return run(`${t.bind}\n${actionJs(name, a, t.isTab)}\nawait tgt.getAXState();`, t);
+        return run(`${t.bind}\n${actionJs(name, a, t.isTab)}\nnodeRepl.write(${J(RAN)});\nawait tgt.getAXState();`, t);
       }
     }
   }

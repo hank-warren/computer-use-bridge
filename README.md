@@ -254,8 +254,11 @@ The tree of a big page or app runs to hundreds of thousands of characters (a
 Wikipedia article is about 200,000), which would fill an agent's context in a
 few calls. Every result keeps only the first `treeMaxChars` characters of each
 tree (default 20,000) and says how much it left out. Element numbers in the
-part shown stay valid. For more, call `get_state` with `max_chars` (0 for the
-whole tree); for page content, `read_tab` and `tab_locator` are more precise.
+part shown stay valid. For more, call `get_state` with `full: true` and
+`max_chars` (0 for the whole tree); for page content, `read_tab` and
+`tab_locator` are more precise. Only trees are capped: tab lists, errors and
+batch messages come back whole, `read_tab` and `eval_tab` have their own
+`max_chars`, and `tab_locator` text is cut at 20,000 characters.
 
 Clients that call tools from code (pi's codemode, for example) can filter
 large results before they reach the model, which is how ChatGPT itself uses
@@ -286,7 +289,7 @@ How tabs are handled, and why:
 
 - `open_tab` opens an ordinary tab with Cmd+T, types the URL into the address
   bar (pasting it through the clipboard, which is restored) and attaches only
-  once the tab is on the real page. It takes about 3 s, or about 6 s as the
+  once the tab has left its starting page. It takes 2-3 s, or about 5 s as the
   first browser call of a new engine.
   - The engine's own `createBrowserTab` (what ChatGPT uses) is faster once warm,
     but always puts the tab in a tab group, and it took 12-20 s on about one in
@@ -296,11 +299,16 @@ How tabs are handled, and why:
   - It refreshes the window's state before pressing keys, because the engine
     refuses input to a window that changed since it last looked (e.g. after
     you used the browser).
+  - It types only while the new tab is still the focused one. If you switch
+    tabs in that moment, `open_tab` fails and leaves the empty tab open
+    rather than typing the URL into your tab.
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
-  and retries the call once. If that fails too, the dead attachment belongs to
-  the session's engine (a new engine attaches the same tab fine), so the bridge
-  restarts the engine and retries once more. A batch is only retried if nothing
-  in it ran yet.
+  the tab; if that fails too, the dead attachment belongs to the session's
+  engine (a new engine attaches the same tab fine), so it restarts the engine.
+  It then replays the call only if nothing in it ran yet and it names no
+  element numbers, which belong to the old attachment. Otherwise it returns
+  the tab's fresh tree, or, if the action already ran, says so and asks for
+  `get_state` instead of a repeat.
 - A tab attached by one session is locked to it until that session's engine
   stops (`release`, idle stop, or the session closing). If the engine dies
   without that, its tabs can only be closed by hand.

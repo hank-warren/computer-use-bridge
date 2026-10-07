@@ -20,6 +20,7 @@ jobs:
         run: |
           node --check computer-use-bridge.mjs
           node --check dev/mcp-call.mjs
+          node dev/logic-test.mjs
           node computer-use-bridge.mjs --version
           node computer-use-bridge.mjs help >/dev/null
       - name: Formula style
