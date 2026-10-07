@@ -7,7 +7,7 @@
 // e.g. '[{"name":"get_state","arguments":{"app":"com.brave.Browser"}}]'.
 // Text results are printed; images are written to DIR (default: a temp dir).
 // --var captures REGEX's first group from any result; later calls substitute {{NAME}},
-// or a number for "{{#NAME}}".
+// or a number for "{{#NAME}}". A {"sleep": MS} entry pauses between calls.
 
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
@@ -60,6 +60,11 @@ if (list) {
 }
 let n = 0;
 for (const raw of calls) {
+  if (raw.sleep !== undefined) {
+    console.log(`=== sleep ${raw.sleep} ms`);
+    await new Promise((r) => setTimeout(r, raw.sleep));
+    continue;
+  }
   // "{{#name}}" (quoted) becomes a number; {{name}} is substituted as text.
   const call = JSON.parse(JSON.stringify(raw)
     .replace(/"\{\{#(\w+)\}\}"/g, (m, n) => (n in values ? String(Number(values[n])) : m))
