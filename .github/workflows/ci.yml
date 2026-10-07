@@ -1,0 +1,30 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Syntax and CLI
+        run: |
+          node --check computer-use-bridge.mjs
+          node --check dev/mcp-call.mjs
+          node computer-use-bridge.mjs --version
+          node computer-use-bridge.mjs help >/dev/null
+      - name: Formula style
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          brew tap local/computer-use-bridge "$GITHUB_WORKSPACE"
+          brew style local/computer-use-bridge/computer-use-bridge

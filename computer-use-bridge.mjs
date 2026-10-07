@@ -1,8 +1,10 @@
-// codex-cu-bridge: expose ChatGPT.app's Codex computer-use engine (cua_repl) to
+// computer-use-bridge: expose ChatGPT.app's Codex computer-use engine (cua_repl) to
 // other MCP clients, over stdio or bearer-authenticated streamable HTTP.
 //
-//   codex-cu-bridge stdio [--raw] [--approve-all] [--config FILE]
-//   codex-cu-bridge serve [--config FILE]
+//   computer-use-bridge setup [--host IP|tailscale|localhost] [--port N] [--allow IDS] [--yes] [--no-service]
+//   computer-use-bridge status [--config FILE]
+//   computer-use-bridge stdio [--raw] [--approve-all] [--config FILE]
+//   computer-use-bridge serve [--config FILE]
 //
 // Surfaces:
 //   raw    cua_repl's own tools (js = arbitrary JavaScript as the Mac user).
@@ -14,18 +16,22 @@
 // Unofficial: relies on ChatGPT.app internals that an update can change.
 
 import { execFile, spawn } from "node:child_process";
-import { randomUUID, timingSafeEqual } from "node:crypto";
-import { readFileSync, readdirSync, existsSync } from "node:fs";
+import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { homedir, hostname, tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, hostname, networkInterfaces, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const PLUGIN_DIR = join(homedir(), ".codex/plugins/cache/openai-bundled/unified-computer-use");
-const DEFAULT_CONFIG = join(homedir(), ".config/codex-cu-bridge/config.json");
+const NAME = "computer-use-bridge";
+const CONFIG_DIR = join(homedir(), ".config", NAME);
+const DEFAULT_CONFIG = join(CONFIG_DIR, "config.json");
+const DEFAULT_PORT = 47800;
 
 // Never controllable through the fixed surface, even if listed in allowApps:
 // shells, script runners, credential stores, system settings and mail/messages.
@@ -39,24 +45,45 @@ const HARD_DENY = new Set([
   "com.apple.mail", "com.apple.MobileSMS",
 ].map((id) => id.toLowerCase()));
 
-const log = (...a) => process.stderr.write(`${new Date().toISOString()} codex-cu-bridge: ${a.join(" ")}\n`);
+const log = (...a) => process.stderr.write(`${new Date().toISOString()} ${NAME}: ${a.join(" ")}\n`);
 const expand = (p) => (p?.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 
 // ---------- configuration ----------
 
+const USAGE = `usage: ${NAME} <command>
+
+  setup    configure the HTTP server for this Mac and start it (interactive)
+           [--host IP|tailscale|localhost] [--port N] [--allow ID,ID] [--yes] [--no-service]
+  status   check the engine, the config and the running server
+  update   upgrade through Homebrew and restart the service
+  serve    run the HTTP server (what the Homebrew service runs)
+  stdio    speak MCP on stdin/stdout, e.g. over SSH [--raw] [--approve-all]
+  version  print the version
+
+All commands take --config FILE (default ${DEFAULT_CONFIG}).`;
+
 function parseArgs(argv) {
-  const [mode, ...rest] = argv;
-  const opts = { mode, raw: false, approveAll: false, config: DEFAULT_CONFIG };
+  let [mode, ...rest] = argv;
+  if (mode === "--version" || mode === "-v") mode = "version";
+  if (mode === "--help" || mode === "-h" || mode === undefined) mode = "help";
+  const opts = { mode, raw: false, approveAll: false, config: DEFAULT_CONFIG, yes: false, service: true };
+  const value = (i) => {
+    if (rest[i + 1] === undefined) throw new Error(`${rest[i]} needs a value`);
+    return rest[i + 1];
+  };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
-    if (a === "--raw") opts.raw = true;
-    else if (a === "--approve-all") opts.approveAll = true;
-    else if (a === "--config") opts.config = rest[++i];
-    else throw new Error(`unknown argument: ${a}`);
+    if (a === "--raw" && mode === "stdio") opts.raw = true;
+    else if (a === "--approve-all" && mode === "stdio") opts.approveAll = true;
+    else if (a === "--config") opts.config = value(i++);
+    else if (mode === "setup" && a === "--host") opts.host = value(i++);
+    else if (mode === "setup" && a === "--port") opts.port = value(i++);
+    else if (mode === "setup" && a === "--allow") opts.allow = value(i++);
+    else if (mode === "setup" && (a === "--yes" || a === "-y")) opts.yes = true;
+    else if (mode === "setup" && a === "--no-service") opts.service = false;
+    else throw new Error(`unknown argument: ${a}\n\n${USAGE}`);
   }
-  if (mode !== "stdio" && mode !== "serve") {
-    throw new Error("usage: codex-cu-bridge stdio [--raw] [--approve-all] [--config FILE] | serve [--config FILE]");
-  }
+  if (!["stdio", "serve", "setup", "status", "update", "version", "help"].includes(mode)) throw new Error(`unknown command: ${mode}\n\n${USAGE}`);
   return opts;
 }
 
@@ -64,7 +91,7 @@ function loadConfig(opts) {
   const file = expand(opts.config);
   const cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
   if (opts.mode === "serve") {
-    if (!cfg.host || !cfg.port || !cfg.tokenFile) throw new Error(`${file} needs host, port and tokenFile`);
+    if (!cfg.host || !cfg.port || !cfg.tokenFile) throw new Error(`${file} needs host, port and tokenFile; run "${NAME} setup"`);
     if (cfg.surface === "raw" || cfg.approve === "all") throw new Error("serve only supports the fixed surface with the allowlist");
     cfg.surface = "fixed";
     cfg.approve = "allowlist";
@@ -77,6 +104,8 @@ function loadConfig(opts) {
   cfg.isAllowed = (id) => cfg.approve === "all" || (typeof id === "string" && allowed.has(id.toLowerCase()));
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
+  cfg.engineIdleMinutes ??= 10;
+  if (typeof cfg.engineIdleMinutes !== "number" || !(cfg.engineIdleMinutes >= 0)) throw new Error("engineIdleMinutes must be a number >= 0 (0 disables)");
   return cfg;
 }
 
@@ -85,7 +114,7 @@ function loadCuaServer() {
   const versions = readdirSync(PLUGIN_DIR)
     .filter((v) => existsSync(join(PLUGIN_DIR, v, ".mcp.json")))
     .sort((a, b) => (key(a) < key(b) ? -1 : 1));
-  if (!versions.length) throw new Error(`no unified-computer-use plugin under ${PLUGIN_DIR}; is ChatGPT.app installed?`);
+  if (!versions.length) throw new Error(`no unified-computer-use plugin under ${PLUGIN_DIR}; open ChatGPT.app and set up Computer Use in Codex`);
   const latest = versions.at(-1);
   const server = JSON.parse(readFileSync(join(PLUGIN_DIR, latest, ".mcp.json"), "utf8")).mcpServers.cua_repl;
   return { ...server, version: latest };
@@ -125,7 +154,7 @@ class CuaChild {
     await this.request("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: { elicitation: { form: {} } },
-      clientInfo: { name: "codex-cu-bridge", version: VERSION },
+      clientInfo: { name: NAME, version: VERSION },
     }, 120_000);
     this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
     log(`[${this.label}] cua_repl ${s.version} started`);
@@ -305,6 +334,11 @@ const locatorProps = {
 
 const TOOL_DEFS = [
   { name: "list_apps", readOnly: true, description: "List the apps this bridge may control and whether they are running.", props: {} },
+  {
+    name: "release",
+    description: "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Detaches browser tabs (they stay open) and stops the engine, which clears the Mac's screen-sharing and browser-debugging indicators. The next call restarts the engine automatically; call get_state again before using element numbers.",
+    props: {},
+  },
   {
     name: "launch_app",
     description: "Start an allowed app in the background without bringing it to the front.",
@@ -524,7 +558,7 @@ async function scaleImage(block, maxWidth) {
   const buf = Buffer.from(block.data, "base64");
   const width = imageWidth(buf);
   if (!maxWidth || !width || width <= maxWidth) return { block, scale: 1 };
-  const dir = await mkdtemp(join(tmpdir(), "codex-cu-bridge-"));
+  const dir = await mkdtemp(join(tmpdir(), `${NAME}-`));
   try {
     const src = join(dir, block.mimeType === "image/png" ? "in.png" : "in.jpg");
     const out = join(dir, "out.jpg");
@@ -548,7 +582,17 @@ class Session {
     this.appNames = null;
     this.lastUsed = Date.now();
     this.scales = new Map();
+    this.busy = 0;
+    this.notice = null;
     this.tools = TOOL_DEFS.filter((t) => t.name !== "eval_tab" || cfg.tabEval !== false).map(toolSchema);
+    // The engine holds screen capture and tab attachments while it runs, so it is
+    // stopped when idle; the MCP session stays open and restarts it on demand.
+    const idleMs = cfg.engineIdleMinutes * 60_000;
+    if (cfg.surface === "fixed" && idleMs > 0) {
+      this.reaper = setInterval(() => {
+        if (this.child && !this.busy && Date.now() - this.lastUsed >= idleMs) this.stopEngine("idle");
+      }, Math.min(30_000, idleMs)).unref();
+    }
   }
 
   async cua() {
@@ -558,12 +602,28 @@ class Session {
       await c.start();
       this.child = c;
       this.appNames = null;
+      if (this.stopReason) {
+        this.notice = `The computer-use engine was restarted (${this.stopReason}), so element numbers from earlier trees are stale; call get_state before using them.`;
+        this.stopReason = null;
+      }
       return c;
     })().finally(() => { this.starting = null; });
     return this.starting;
   }
 
+  // Ends the turn (releasing tabs) and stops cua_repl; the next call starts a new one.
+  async stopEngine(why) {
+    const c = this.child;
+    if (!c) return false;
+    this.child = null;
+    this.stopReason = why;
+    log(`[${this.label}] stopping engine (${why})`);
+    await c.close();
+    return true;
+  }
+
   close() {
+    clearInterval(this.reaper);
     return this.child?.close();
   }
 
@@ -573,6 +633,7 @@ class Session {
       "For native apps, call get_state(app) first; element numbers refer to the latest tree and change after UI updates. Actions return a diff of the tree. " +
       "For web pages in an allowed browser, prefer tabs: list_tabs or open_tab, then pass tab instead of app to get_state, screenshot and the actions; read_tab, eval_tab and tab_locator work on tabs only. " +
       "Use batch to run several actions in one call. Screenshots are downscaled; coordinates you give refer to the image you received. " +
+      "Call release when you finish with computer use, or before waiting more than a few minutes; it clears the screen-sharing and browser-debugging indicators on the Mac. " +
       "Input goes to the target without moving the user's cursor, but the user may be using the same window. " +
       "Ask the user before sending messages, submitting forms, purchasing, or transmitting sensitive data.";
   }
@@ -591,11 +652,18 @@ class Session {
       const timeout = (Number.isFinite(args.timeout_ms) ? args.timeout_ms : 30_000) + 30_000;
       return (await this.cua()).call(name, args, timeout);
     }
+    this.busy++;
     try {
-      return await this.callFixed(name, args ?? {});
+      const res = await this.callFixed(name, args ?? {});
+      if (this.notice && this.child && name !== "get_state") res.content.unshift({ type: "text", text: this.notice });
+      if (this.child) this.notice = null;
+      return res;
     } catch (e) {
       if (e instanceof BadInput) return textResult(e.message, true);
       throw e;
+    } finally {
+      this.busy--;
+      this.lastUsed = Date.now();
     }
   }
 
@@ -724,6 +792,10 @@ if (fresh) {
     };
 
     switch (name) {
+      case "release":
+        return textResult(await this.stopEngine("released")
+          ? "Released: browser tabs detached and the engine stopped. The next call restarts it."
+          : "Nothing to release; the engine is not running.");
       case "list_apps": {
         const ids = this.cfg.approve === "all" ? null : this.cfg.allowApps;
         return this.js(`const ids = ${J(ids)}; const apps = await cua.listApps({ emit: false });
@@ -862,7 +934,7 @@ async function handle(session, msg) {
         return ok({
           protocolVersion: PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[1],
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: "codex-cu-bridge", version: VERSION },
+          serverInfo: { name: NAME, version: VERSION },
           instructions: session.instructions(),
         });
       }
@@ -984,11 +1056,302 @@ function runHttp(cfg) {
   process.on("SIGINT", stop);
 }
 
+// ---------- setup and status ----------
+
+const LEGACY = {
+  dir: join(homedir(), ".config/codex-cu-bridge"),
+  label: "com.hank-warren.codex-cu-bridge",
+  files: [join(homedir(), ".local/bin/codex-cu-bridge"), join(homedir(), ".local/share/codex-cu-bridge")],
+};
+const LEGACY_PLIST = join(homedir(), "Library/LaunchAgents", `${LEGACY.label}.plist`);
+const KNOWN_APPS = [
+  ["com.brave.Browser", "Brave Browser"], ["com.google.Chrome", "Google Chrome"], ["com.microsoft.edgemac", "Microsoft Edge"],
+  ["com.tinyspeck.slackmacgap", "Slack"], ["com.hnc.Discord", "Discord"],
+];
+
+const run = (cmd, args, timeout = 30_000) => new Promise((resolve) => {
+  execFile(cmd, args, { timeout }, (e, stdout, stderr) => resolve({ ok: !e, code: e?.code ?? 0, stdout: String(stdout), stderr: String(stderr) }));
+});
+const say = (s = "") => process.stdout.write(s + "\n");
+const readJson = (f) => JSON.parse(readFileSync(f, "utf8"));
+const writePrivate = (f, text) => {
+  mkdirSync(dirname(f), { recursive: true, mode: 0o700 });
+  writeFileSync(f, text, { mode: 0o600 });
+  chmodSync(f, 0o600);
+};
+const inRange = (ip, [base, bits]) => {
+  const n = (s) => s.split(".").reduce((a, o) => a * 256 + Number(o), 0);
+  const mask = 2 ** 32 - 2 ** (32 - bits);
+  return (n(ip) & mask) >>> 0 === (n(base) & mask) >>> 0;
+};
+
+// Tailscale's IPv4: from its CLI, or the CGNAT-range address on a tunnel interface.
+async function tailscaleIp() {
+  for (const cli of ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]) {
+    if (!existsSync(cli)) continue;
+    const r = await run(cli, ["ip", "-4"], 5000);
+    const ip = r.stdout.trim().split("\n")[0];
+    if (r.ok && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) return ip;
+  }
+  for (const [name, addrs] of Object.entries(networkInterfaces())) {
+    const a = (addrs ?? []).find((x) => x.family === "IPv4" && inRange(x.address, ["100.64.0.0", 10]));
+    if (a && name.startsWith("utun")) return a.address;
+  }
+  return null;
+}
+
+function lanIps() {
+  const out = [];
+  for (const [name, addrs] of Object.entries(networkInterfaces())) {
+    for (const a of addrs ?? []) {
+      if (a.family !== "IPv4" || a.internal) continue;
+      if ([["10.0.0.0", 8], ["172.16.0.0", 12], ["192.168.0.0", 16]].some((r) => inRange(a.address, r))) out.push({ ip: a.address, name });
+    }
+  }
+  return out;
+}
+
+async function installedApps() {
+  const found = [];
+  for (const [id, label] of KNOWN_APPS) {
+    const r = await run("/usr/bin/mdfind", [`kMDItemCFBundleIdentifier == '${id}'`], 5000);
+    if (r.stdout.trim() || existsSync(`/Applications/${label}.app`)) found.push([id, label]);
+  }
+  return found;
+}
+
+function brewPath() {
+  for (const p of [process.env.HOMEBREW_PREFIX && join(process.env.HOMEBREW_PREFIX, "bin/brew"), "/opt/homebrew/bin/brew", "/usr/local/bin/brew"]) {
+    if (p && existsSync(p)) return p;
+  }
+  return null;
+}
+
+async function health(host, port, waitMs = 0) {
+  const until = Date.now() + waitMs;
+  for (;;) {
+    try {
+      const r = await fetch(`http://${host}:${port}/healthz`, { signal: AbortSignal.timeout(2000) });
+      if (r.ok) return await r.json();
+    } catch {}
+    if (Date.now() >= until) return null;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+}
+
+// Starts cua_repl and lists apps, which proves the engine and its macOS permissions work.
+async function probeEngine() {
+  const c = new CuaChild({ approve: "allowlist", isAllowed: () => false }, "probe");
+  try {
+    await c.start();
+    const r = await c.call("js", { code: `nodeRepl.write(String((await cua.listApps({ emit: false })).length))`, timeout_ms: 20_000 }, 40_000);
+    const text = (r.content ?? []).filter((x) => x.type === "text").map((x) => x.text).join("\n");
+    const n = /^\d+$/m.exec(text)?.[0];
+    return r.isError || !n ? { ok: false, detail: text.slice(0, 500) } : { ok: true, detail: `${n} apps visible` };
+  } catch (e) {
+    return { ok: false, detail: e.message };
+  } finally {
+    if (!c.dead) c.proc?.kill("SIGTERM");
+  }
+}
+
+function clientHelp(cfg) {
+  const url = `http://${cfg.host}:${cfg.port}/mcp`;
+  const mac = hostname().replace(/\.local$/, "").toLowerCase();
+  const tokenName = `${mac}.token`;
+  say(`
+Connect a client to ${url}
+
+1. Copy the token to the client without printing it, e.g. from the client:
+     ssh ${mac} 'cat ${cfg.tokenFile}' | (umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${tokenName})
+
+2. pi (~/.pi/agent/mcp.json, under "mcpServers"):
+     "${mac}-cu": {
+       "url": "${url}",
+       "headers": { "Authorization": "!echo Bearer $(cat ~/.config/${NAME}/${tokenName})" },
+       "timeout": 120
+     }
+
+   Claude Code:
+     claude mcp add --transport http ${mac}-cu ${url} --header "Authorization: Bearer $(cat ~/.config/${NAME}/${tokenName})"
+
+   Over SSH instead of HTTP (stdio):
+     ssh -T ${mac} ${brewPath() ? join(dirname(brewPath()), NAME) : NAME} stdio`);
+}
+
+async function setup(opts) {
+  const file = expand(opts.config);
+  const interactive = !opts.yes && process.stdin.isTTY;
+  const rl = interactive ? createPrompt({ input: process.stdin, output: process.stdout }) : null;
+  const ask = async (q, def) => {
+    if (!rl) return def;
+    const a = (await rl.question(`${q}${def !== undefined && def !== "" ? ` [${def}]` : ""}: `)).trim();
+    return a || def;
+  };
+  const confirm = async (q, def = true) => {
+    const a = await ask(`${q} (${def ? "Y/n" : "y/N"})`, "");
+    return a ? /^y/i.test(a) : def;
+  };
+  try {
+    say(`${NAME} ${VERSION} setup\n`);
+
+    let engine;
+    try { engine = loadCuaServer(); } catch (e) { throw new Error(`${e.message}. Then run setup again.`); }
+    say(`Engine: unified-computer-use ${engine.version} from ChatGPT.app`);
+
+    // Older installs used ~/.config/codex-cu-bridge and their own LaunchAgent.
+    if (!existsSync(file) && file === DEFAULT_CONFIG && existsSync(join(LEGACY.dir, "config.json"))) {
+      const old = readJson(join(LEGACY.dir, "config.json"));
+      const oldToken = expand(old.tokenFile ?? join(LEGACY.dir, "token"));
+      if (existsSync(oldToken)) {
+        writePrivate(join(CONFIG_DIR, "token"), readFileSync(oldToken));
+        old.tokenFile = join(CONFIG_DIR, "token");
+      }
+      writePrivate(file, JSON.stringify(old, null, 2) + "\n");
+      say(`Migrated config and token from ${LEGACY.dir} (clients keep working with the same token).`);
+    }
+    if (file === DEFAULT_CONFIG && existsSync(LEGACY_PLIST) && await confirm(`Remove the old LaunchAgent ${LEGACY.label}? It would hold the same port`)) {
+      await run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LEGACY.label}`]);
+      rmSync(LEGACY_PLIST, { force: true });
+      for (const f of LEGACY.files) rmSync(f, { recursive: true, force: true });
+      say("Removed the old LaunchAgent and program files.");
+    }
+
+    const cfg = existsSync(file) ? readJson(file) : {};
+
+    // Where to listen.
+    const ts = await tailscaleIp();
+    const lans = lanIps();
+    let host = opts.host;
+    if (host === "tailscale") host = ts ?? (() => { throw new Error("Tailscale is not connected on this Mac"); })();
+    if (host === "localhost") host = "127.0.0.1";
+    if (!host) {
+      const choices = [];
+      if (ts) choices.push({ ip: ts, label: "Tailscale (recommended: only your tailnet can reach it, and traffic is encrypted)" });
+      for (const l of lans) choices.push({ ip: l.ip, label: `local network on ${l.name} (plain HTTP: anyone on this network can see traffic and the token)` });
+      choices.push({ ip: "127.0.0.1", label: "this Mac only (clients over SSH tunnels)" });
+      const current = choices.findIndex((c) => c.ip === cfg.host);
+      if (cfg.host && current < 0) choices.unshift({ ip: cfg.host, label: "current config (not an address of this Mac right now)" });
+      say("\nListen on:");
+      choices.forEach((c, i) => say(`  ${i + 1}) ${c.ip}  ${c.label}`));
+      const def = Math.max(0, choices.findIndex((c) => c.ip === cfg.host)) + 1;
+      const pick = String(await ask("Choose a number or type an IPv4 address", String(def)));
+      host = /^\d+$/.test(pick) ? choices[Number(pick) - 1]?.ip : pick;
+      if (!host) throw new Error("no such choice");
+    }
+    if (!/^\d+\.\d+\.\d+\.\d+$/.test(host)) throw new Error(`host must be an IPv4 address, tailscale or localhost (got ${host})`);
+    if (lans.some((l) => l.ip === host)) say("Warning: the local network sees plain HTTP. Prefer Tailscale for anything but a trusted home network.");
+
+    const port = Number(opts.port ?? await ask("Port", String(cfg.port ?? DEFAULT_PORT)));
+    if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("port must be 1024-65535");
+
+    // Which apps clients may control.
+    let allow = opts.allow?.split(",").map((s) => s.trim()).filter(Boolean);
+    if (!allow) {
+      const found = await installedApps();
+      const current = cfg.allowApps ?? found.filter(([id]) => id !== "com.google.Chrome" && id !== "com.microsoft.edgemac").map(([id]) => id);
+      say("\nApps clients may control (comma-separated bundle IDs). Installed and supported here:");
+      for (const [id, label] of found) say(`  ${id}  ${label}`);
+      say("Find any app's ID with: osascript -e 'id of app \"App Name\"'");
+      allow = String(await ask("Allow", current.join(","))).split(",").map((s) => s.trim()).filter(Boolean);
+    }
+    const denied = allow.filter((id) => HARD_DENY.has(id.toLowerCase()));
+    if (denied.length) say(`Ignoring always-denied apps: ${denied.join(", ")}`);
+    allow = allow.filter((id) => !HARD_DENY.has(id.toLowerCase()));
+
+    const tokenFile = expand(cfg.tokenFile ?? join(CONFIG_DIR, "token"));
+    if (!existsSync(tokenFile) || readFileSync(tokenFile, "utf8").trim().length < 32) {
+      writePrivate(tokenFile, randomBytes(32).toString("hex") + "\n");
+      say(`Generated a new token in ${tokenFile}`);
+    }
+    chmodSync(tokenFile, 0o600);
+
+    Object.assign(cfg, { host, port, tokenFile, allowApps: allow });
+    cfg.idleMinutes ??= 30;
+    cfg.maxSessions ??= 4;
+    cfg.engineIdleMinutes ??= 10;
+    writePrivate(file, JSON.stringify(cfg, null, 2) + "\n");
+    say(`Wrote ${file}`);
+
+    say("\nChecking the engine (this needs the Computer Use permissions granted in ChatGPT)...");
+    const probe = await probeEngine();
+    say(probe.ok ? `Engine OK: ${probe.detail}` : `Engine check failed: ${probe.detail}\nOpen ChatGPT, finish Computer Use setup in Codex, and run setup again.`);
+
+    const brew = brewPath();
+    const managed = brew && (await run(brew, ["list", "--formula", NAME])).ok;
+    if (opts.service && managed) {
+      say("\nStarting the Homebrew service...");
+      const r = await run(brew, ["services", "restart", NAME], 60_000);
+      if (!r.ok) say(r.stderr.trim() || r.stdout.trim());
+    } else if (opts.service) {
+      say(`\nNot installed through Homebrew; run "${NAME} serve" under your own supervisor.`);
+    }
+    const h = opts.service && managed ? await health(host, port, 15_000) : await health(host, port);
+    say(h ? `Listening on http://${host}:${port}/mcp (version ${h.version})` : `Not answering on http://${host}:${port} yet; see "${NAME} status".`);
+    clientHelp(cfg);
+  } finally {
+    rl?.close();
+  }
+}
+
+// brew upgrade does not restart services, so this does both.
+async function update() {
+  const brew = brewPath();
+  if (!brew || !(await run(brew, ["list", "--formula", NAME])).ok) throw new Error(`${NAME} was not installed through Homebrew`);
+  const step = (args) => new Promise((resolve, reject) => {
+    say(`$ brew ${args.join(" ")}`);
+    spawn(brew, args, { stdio: "inherit" }).on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`brew ${args[0]} failed (${code})`))));
+  });
+  await step(["update", "--quiet"]);
+  await step(["upgrade", NAME]);
+  await step(["services", "restart", NAME]);
+  const r = await run(join(dirname(brew), NAME), ["version"]);
+  say(`Now running ${r.stdout.trim()}`);
+}
+
+async function status(opts) {
+  const file = expand(opts.config);
+  let bad = false;
+  const line = (ok, s) => { if (!ok) bad = true; say(`${ok ? "ok  " : "FAIL"}  ${s}`); };
+  say(`${NAME} ${VERSION}`);
+  try { line(true, `engine: unified-computer-use ${loadCuaServer().version}`); } catch (e) { line(false, e.message); }
+  let cfg = null;
+  try {
+    cfg = loadConfig({ ...opts, mode: "serve" });
+    const tokenOk = existsSync(expand(cfg.tokenFile)) && readFileSync(expand(cfg.tokenFile), "utf8").trim().length >= 32;
+    line(true, `config: ${file}`);
+    line(tokenOk, `token: ${cfg.tokenFile}`);
+    say(`      listen http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ") || "(none)"}; engine idle stop: ${cfg.engineIdleMinutes || "off"} min`);
+  } catch (e) { line(false, `config: ${e.message}`); }
+  const brew = brewPath();
+  if (brew) {
+    const r = await run(brew, ["services", "info", NAME, "--json"]);
+    let info = null;
+    try { info = r.ok ? JSON.parse(r.stdout)[0] : null; } catch {}
+    if (info) line(info.running, `service: ${info.running ? `running (pid ${info.pid})` : info.status ?? "not running"}`);
+  }
+  if (existsSync(LEGACY_PLIST)) line(false, `old LaunchAgent still installed (${LEGACY.label}); run "${NAME} setup" to remove it`);
+  if (cfg) {
+    const h = await health(cfg.host, cfg.port);
+    line(!!h, h ? `server: answering, version ${h.version}${h.version !== VERSION ? " (restart the service to run this version)" : ""}` : `server: not answering on ${cfg.host}:${cfg.port}`);
+  }
+  const probe = await probeEngine();
+  line(probe.ok, `engine probe: ${probe.detail}`);
+  return bad ? 1 : 0;
+}
+
 try {
   const opts = parseArgs(process.argv.slice(2));
-  const cfg = loadConfig(opts);
-  if (opts.mode === "serve") runHttp(cfg);
-  else runStdio(cfg);
+  if (opts.mode === "help") say(USAGE);
+  else if (opts.mode === "version") say(VERSION);
+  else if (opts.mode === "setup") { await setup(opts); process.exit(0); }
+  else if (opts.mode === "status") process.exit(await status(opts));
+  else if (opts.mode === "update") { await update(); process.exit(0); }
+  else {
+    const cfg = loadConfig(opts);
+    if (opts.mode === "serve") runHttp(cfg);
+    else runStdio(cfg);
+  }
 } catch (e) {
   log(e.message);
   process.exit(2);
