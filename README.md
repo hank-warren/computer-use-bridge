@@ -292,7 +292,10 @@ How tabs are handled, and why:
   engine connects to the browser extension; after that, `open_tab` takes
   under a second.
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
-  and retries the call once. A batch is only retried if nothing in it ran yet.
+  and retries the call once. If that fails too, the dead attachment belongs to
+  the session's engine (a new engine attaches the same tab fine), so the bridge
+  restarts the engine and retries once more. A batch is only retried if nothing
+  in it ran yet.
 - A tab attached by one session is locked to it until that session's engine
   stops (`release`, idle stop, or the session closing). If the engine dies
   without that, its tabs can only be closed by hand.

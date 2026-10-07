@@ -807,10 +807,19 @@ if (fresh) {
     if (!/Debugger (unattached|detached|is not attached)/i.test(text)) return res;
     if (name === "batch" && /Batch stopped at step (?!1 )\d+/.test(text)) return res;
     log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching and retrying ${name}`);
-    const again = await this.callFixedOnce(name, { ...a, rebind: true });
-    again.content.unshift({ type: "text", text: again.isError
-      ? "The tab's debugger had detached and re-attaching did not help; open the page in a new tab with open_tab."
-      : "The tab's debugger had detached; the bridge re-attached it and retried." });
+    let again = await this.callFixedOnce(name, { ...a, rebind: true });
+    const stuck = (r) => r.isError && /Debugger (unattached|detached|is not attached)/i.test(r.content.map((c) => c.text ?? "").join("\n"));
+    // The dead attachment belongs to this engine; a new engine attaches the same tab fine.
+    if (stuck(again)) {
+      await this.stopEngine("tab debugger stuck");
+      again = await this.callFixedOnce(name, a);
+      this.notice = null;
+      again.content.unshift({ type: "text", text: stuck(again)
+        ? "The tab's debugger had detached and even a new engine could not re-attach it; open the page in a new tab with open_tab."
+        : "The tab's debugger had detached; the bridge restarted the engine and retried. Other tabs and windows of this session were re-attached, so call get_state before using their element numbers." });
+      return again;
+    }
+    again.content.unshift({ type: "text", text: "The tab's debugger had detached; the bridge re-attached it and retried." });
     return again;
   }
 
@@ -824,7 +833,7 @@ if (fresh) {
       for (const c of res.content) {
         if (!cap || c.type !== "text" || c.text.length <= cap) continue;
         const cut = c.text.lastIndexOf("\n", cap) > cap * 0.8 ? c.text.lastIndexOf("\n", cap) : cap;
-        const more = t?.isTab ? "; for page content use read_tab or tab_locator" : "";
+        const more = t?.isTab || name === "open_tab" ? "; for page content use read_tab or tab_locator" : "";
         c.text = `${c.text.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${c.text.length} characters. Elements after this point exist but are not listed. Use get_state with a larger max_chars to see them${more}.]`;
       }
       for (const [i, c] of [...res.content.entries()]) {
