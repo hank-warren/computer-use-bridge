@@ -150,6 +150,7 @@ the allowlist.
 | `tunnels` | Reverse SSH tunnels, e.g. `[{"ssh": "devvm", "remotePort": 47801}]`. See [Remote machines over SSH](#remote-machines-over-ssh). |
 | `screenshotMaxWidth` | Downscale screenshots to this width (default 1280; 0 keeps full size). |
 | `tabEval` | `false` removes the `eval_tab` tool. |
+| `treeMaxChars` | Cap on the accessibility tree in each result (default 20000; 0 for no limit). See [Result size](#result-size). |
 
 After editing it by hand, run `brew services restart computer-use-bridge`.
 Find an app's bundle ID with `osascript -e 'id of app "Brave Browser"'`.
@@ -247,6 +248,22 @@ config, nothing about SSH runs.
 The bound window may also be the one you are using, so agent input and yours
 can interleave.
 
+### Result size
+
+The tree of a big page or app runs to hundreds of thousands of characters (a
+Wikipedia article is about 200,000), which would fill an agent's context in a
+few calls. Every result keeps only the first `treeMaxChars` characters of each
+tree (default 20,000) and says how much it left out. Element numbers in the
+part shown stay valid. For more, call `get_state` with `full: true` and
+`max_chars` (0 for the whole tree); for page content, `read_tab` and
+`tab_locator` are more precise. Only trees are capped: tab lists, errors and
+batch messages come back whole, `read_tab` and `eval_tab` have their own
+`max_chars`, and `tab_locator` text is cut at 20,000 characters.
+
+Clients that call tools from code (pi's codemode, for example) can filter
+large results before they reach the model, which is how ChatGPT itself uses
+the engine; the cap protects clients that pass results straight through.
+
 Screenshots are downscaled to `max_width` (default 1280) with `sips` before
 they leave the Mac. Coordinates a client sends back refer to the image it
 received; the bridge maps them to the window.
@@ -270,13 +287,30 @@ ChatGPT's browser extension connected), work on tabs instead of the window:
 
 How tabs are handled, and why:
 
-- `open_tab` opens the tab natively (Cmd+T in the front window) and then
-  attaches to it, because tabs created through the browser API always land
-  in a "ChatGPT" tab group. The new tab becomes the active tab. It refreshes
-  the window's state first, because the engine refuses input to a window that
-  changed since it last looked (e.g. after you used the browser).
+- `open_tab` opens an ordinary tab with Cmd+T, types the URL into the address
+  bar (pasting it through the clipboard, which is restored) and attaches only
+  once the tab has left its starting page. It takes 2-3 s, or about 5 s as the
+  first browser call of a new engine.
+  - The engine's own `createBrowserTab` (what ChatGPT uses) is faster once warm,
+    but always puts the tab in a tab group, and it took 12-20 s on about one in
+    three new engines.
+  - Attaching while the tab was still on the browser's new-tab page sometimes
+    hung for about 20 s or left the tab with a dead debugger.
+  - It refreshes the window's state before pressing keys, because the engine
+    refuses input to a window that changed since it last looked (e.g. after
+    you used the browser).
+  - It types only while the new tab is still the focused one, and only if it
+    is the only new tab. If you switch or open tabs in that moment, `open_tab`
+    fails and leaves the empty tab open rather than typing into your tab.
+  - If the browser's new-tab page is itself a web page, a URL that redirects
+    back to it is reported as not reached.
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
-  and retries the call once. A batch is only retried if nothing in it ran yet.
+  the tab; if that fails too, the dead attachment belongs to the session's
+  engine (a new engine attaches the same tab fine), so it restarts the engine.
+  It then replays the call only if no action in it had started and it names
+  no element numbers, which belong to the old attachment. Otherwise it returns
+  the tab's fresh tree and says whether the action ran, may have run, or did
+  not run.
 - A tab attached by one session is locked to it until that session's engine
   stops (`release`, idle stop, or the session closing). If the engine dies
   without that, its tabs can only be closed by hand.

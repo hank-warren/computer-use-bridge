@@ -25,7 +25,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const PLUGIN_DIR = join(homedir(), ".codex/plugins/cache/openai-bundled/unified-computer-use");
 const NAME = "computer-use-bridge";
@@ -265,10 +265,17 @@ class CuaChild {
 const BROWSER_APPS = {
   brave: "com.brave.Browser", chrome: "com.google.Chrome", edge: "com.microsoft.edgemac", chromium: "org.chromium.Chromium",
 };
-const FAIL = "[[cub-failed]]";
+// Output markers carry a per-process nonce, so page text cannot pass for one.
+const NONCE = randomBytes(6).toString("hex");
+const FAIL = `[[cub-failed-${NONCE}]]`;
 // Every call writes this, so the bridge can tell its own output from cua_repl's.
-const MARK = "[[cub-out]]";
+const MARK = `[[cub-out-${NONCE}]]`;
+// Written just before and just after an action with effects, so a failed call is not replayed.
+const START = `[[cub-start-${NONCE}]]`;
+const RAN = `[[cub-ran-${NONCE}]]`;
+const act = (code) => `nodeRepl.write(${J(START)});\n${code}\nnodeRepl.write(${J(RAN)});`;
 const DEFAULT_MAX_WIDTH = 1280;
+const DEFAULT_TREE_MAX = 20_000;
 
 const appProp = { type: "string", description: "Bundle ID (e.g. com.brave.Browser) or app name; must be an allowed app." };
 const tabProp = { type: "string", description: "Browser tab ID from list_tabs or open_tab. Give tab instead of app to act inside that tab." };
@@ -359,7 +366,10 @@ const TOOL_DEFS = [
     name: "get_state",
     readOnly: true,
     description: "Return the accessibility tree of an app's frontmost window (binding it on the first call, or again with rebind=true after the user switches windows) or of a browser tab. Later calls return a diff unless full=true.",
-    props: { app: appProp, tab: tabProp, full: { type: "boolean" }, rebind: { type: "boolean" }, screenshot: { type: "boolean" }, max_width: maxWidthProp },
+    props: {
+      app: appProp, tab: tabProp, full: { type: "boolean" }, rebind: { type: "boolean" }, screenshot: { type: "boolean" }, max_width: maxWidthProp,
+      max_chars: { type: "integer", minimum: 0, description: `Return at most this many characters of the tree (default ${DEFAULT_TREE_MAX} unless the server sets treeMaxChars; 0 for no limit). With full: true it returns the whole tree rather than a diff. Other tools always use the server's limit.` },
+    },
   },
   { name: "screenshot", readOnly: true, description: "Screenshot of the app's bound window or of a browser tab.", props: { app: appProp, tab: tabProp, max_width: maxWidthProp } },
   ...Object.entries(ACTIONS).map(([name, d]) => ({
@@ -533,7 +543,7 @@ function locatorJs(a) {
     case "check": return { code: `await ${loc}.check(${J(t)});` };
     case "uncheck": return { code: `await ${loc}.uncheck(${J(t)});` };
     case "select_option": return { code: `await ${loc}.selectOption(${value()}, ${J(t)});` };
-    case "text": return { code: `nodeRepl.write(await ${loc}.innerText(${J(t)}));`, read: true };
+    case "text": return { code: `nodeRepl.write(__trunc(await ${loc}.innerText(${J(t)}), 20000));`, read: true };
     case "count": return { code: `nodeRepl.write(String(await ${loc}.count()));`, read: true };
     default: throw new BadInput("action must be click, dblclick, fill, type, press, check, uncheck, select_option, text or count");
   }
@@ -683,22 +693,28 @@ class Session {
     // A block keeps generated bindings out of the persistent REPL scope.
     const res = await (await this.cua()).call("js", { code: `{\n${code}\n}`, timeout_ms: timeoutMs }, timeoutMs + 30_000);
     let failed = !!res.isError;
+    let started = false, ran = false;
     const content = [];
     for (const [i, c] of (res.content ?? []).entries()) {
       if (c.type !== "text") { content.push(c); continue; }
       // Drop cua_repl's first-use API docs; fixed-surface clients cannot use them.
       if (/^(## Computer Use|# Other Browser APIs)/.test(c.text)) continue;
       if (trim && !c.text.includes(MARK) && !(res.isError && i === 0)) continue;
-      let text = c.text.replaceAll(MARK, "");
+      // error: the thrown message; out: the bridge's own writes; state: a tree cua_repl displayed.
+      const kind = res.isError && i === 0 ? "error" : c.text.includes(MARK) ? "out" : "state";
+      if (c.text.includes(START)) started = true;
+      if (c.text.includes(RAN)) ran = true;
+      let text = c.text.replaceAll(MARK, "").replaceAll(START, "").replaceAll(RAN, "");
       if (text.includes(FAIL)) {
         failed = true;
         text = text.replaceAll(FAIL, "");
       }
       // E.g. a password manager's inline autofill menu; tab automation stays blocked until it closes.
       if (/another extension UI is open/.test(text)) text += "\nDismiss it with press_key (key Escape) on the browser app, not the tab, then retry.";
-      if (text.trim()) content.push({ ...c, text });
+      if (text.trim()) content.push(Object.defineProperty({ ...c, text }, "kind", { value: kind }));
     }
-    return { content: content.length ? content : [{ type: "text", text: "ok" }], isError: failed };
+    const out = { content: content.length ? content : [{ type: "text", text: "ok" }], isError: failed };
+    return Object.defineProperties(out, { started: { value: started }, ran: { value: ran } });
   }
 
   async resolveApp(app) {
@@ -779,33 +795,87 @@ if (fresh) {
     return { isTab: false, key: `app:${id}`, bind: Session.bindApp(J(id), a.rebind) };
   }
 
+  // Trees of big pages run to hundreds of thousands of characters; results keep the
+  // top of each so they fit an agent's context. read_tab and eval_tab have their own limit.
+  treeCap(name, a) {
+    if (name === "read_tab" || name === "eval_tab") return 0;
+    const n = name === "get_state" && a.max_chars !== undefined ? a.max_chars : this.cfg.treeMaxChars ?? DEFAULT_TREE_MAX;
+    if (!Number.isInteger(n) || n < 0) throw new BadInput("max_chars must be a non-negative integer");
+    return n;
+  }
+
   maxWidth(a) {
     const w = a.max_width ?? this.cfg.screenshotMaxWidth ?? DEFAULT_MAX_WIDTH;
     if (!Number.isInteger(w) || w < 0 || w > 4000) throw new BadInput("max_width must be an integer from 0 to 4000");
     return w;
   }
 
-  // A tab whose debugger detached stays broken under its cached handle, so re-attach
-  // and retry once. Batches only retry when nothing ran yet (stopped at step 1).
+  // A tab whose debugger detached stays broken under its cached handle: re-attach it, and
+  // if that fails too, restart the engine (a new engine attaches the same tab fine). A call
+  // is replayed only if no action in it started (START) and it names no element numbers,
+  // which belong to the old attachment; otherwise the caller gets the tab's fresh tree.
   async callFixed(name, a) {
-    const res = await this.callFixedOnce(name, a);
-    const text = res.isError && a.tab !== undefined ? res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") : "";
-    if (!/Debugger (unattached|detached|is not attached)/i.test(text)) return res;
-    if (name === "batch" && /Batch stopped at step (?!1 )\d+/.test(text)) return res;
-    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching and retrying ${name}`);
-    const again = await this.callFixedOnce(name, { ...a, rebind: true });
-    again.content.unshift({ type: "text", text: again.isError
-      ? "The tab's debugger had detached and re-attaching did not help; open the page in a new tab with open_tab."
-      : "The tab's debugger had detached; the bridge re-attached it and retried." });
-    return again;
+    const detached = (r) => r.isError && /Debugger (unattached|detached|is not attached)/i.test(r.content.map((c) => c.text ?? "").join("\n"));
+    const say = (r, text) => { r.content.unshift({ type: "text", text }); return r; };
+    let outcome = await this.callFixedOnce(name, a);
+    if (a.tab === undefined || !detached(outcome)) return outcome;
+    const elements = name === "batch"
+      ? Array.isArray(a.actions) && a.actions.some((s) => s?.element !== undefined)
+      : a.element !== undefined;
+    let replay = !outcome.started && !elements;
+    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching${replay ? ` and retrying ${name}` : ""}`);
+    let restarted = false;
+    for (const stage of ["rebind", "restart"]) {
+      if (stage === "restart") {
+        await this.stopEngine("tab debugger stuck");
+        restarted = true;
+      }
+      const rebind = stage === "rebind";
+      const r = replay
+        ? await this.callFixedOnce(name, { ...a, rebind })
+        : await this.callFixedOnce("get_state", { tab: a.tab, full: true, rebind });
+      // The new engine's generic restart notice; the messages here say more.
+      if (restarted) this.notice = null;
+      if (replay) outcome = r;
+      if (!detached(r)) {
+        const how = restarted ? "the bridge restarted the engine to re-attach it" : "the bridge re-attached it";
+        const others = restarted ? " Other tabs and windows of this session were re-attached too, so call get_state before using their element numbers." : "";
+        if (replay) return say(r, `The tab's debugger had detached; ${how} and retried.${others}`);
+        r.isError = !outcome.ran;
+        return say(r, `${outcome.ran
+          ? `Your ${name} ran, but the tab's debugger detached before the bridge could read the tree back; ${how}. Do not repeat it.`
+          : outcome.started
+            ? `The tab's debugger detached while your ${name} was running, so it may or may not have taken effect; ${how}. Check the tree before retrying.`
+            : `The tab's debugger had detached; ${how}. Your ${name} did NOT run, because its element numbers belonged to the old attachment; choose elements from this tree and call ${name} again.`
+        } The tab's current tree follows.${others}`);
+      }
+      // A replay that got as far as starting its action must not be replayed again.
+      if (replay && r.started) replay = false;
+    }
+    const what = outcome.ran ? `Your ${name} ran, but the` : outcome.started ? `Your ${name} may or may not have taken effect: the` : "The";
+    return say(outcome, `${what} tab's debugger detached and even a new engine could not re-attach it; open the page in a new tab with open_tab.`);
   }
 
   async callFixedOnce(name, a) {
     if (!this.tools.some((t) => t.name === name)) throw new BadInput(`unknown tool ${name}`);
     const maxWidth = this.maxWidth(a);
+    const cap = this.treeCap(name, a);
     // Screenshots are downscaled here; the factor maps the client's coordinates back.
     const run = async (body, t, timeoutMs, { trim = false } = {}) => {
       const res = await this.js(`${prelude(t ? (this.scales.get(t.key) ?? 1) : 1)}\n${body}`, timeoutMs, { trim });
+      // Only trees are capped: cua_repl's displayed states, and open_tab's own write of one,
+      // whose first line ("Opened tab N") is kept whole.
+      for (const c of res.content) {
+        if (!cap || c.type !== "text" || c.text.length <= cap) continue;
+        if (c.kind !== "state" && !(c.kind === "out" && name === "open_tab")) continue;
+        const head = c.kind === "out" ? c.text.indexOf("\n") + 1 : 0;
+        const tree = c.text.slice(head);
+        if (tree.length <= cap) continue;
+        let cut = tree.lastIndexOf("\n", cap);
+        if (cut < cap * 0.8) cut = /[\uD800-\uDBFF]/.test(tree[cap - 1]) ? cap - 1 : cap;
+        const more = t?.isTab || name === "open_tab" ? "; for page content use read_tab or tab_locator" : "";
+        c.text = `${c.text.slice(0, head)}${tree.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${tree.length} characters. Elements after this point exist but are not listed. To see them, call get_state with full: true and a larger max_chars (0 for no limit)${more}.]`;
+      }
       for (const [i, c] of [...res.content.entries()]) {
         if (c.type !== "image") continue;
         const scaled = await scaleImage(c, maxWidth);
@@ -852,7 +922,8 @@ ${shot}`, t);
           if (action !== "wait" && !ACTIONS[action]) throw new BadInput(`step ${i + 1}: unknown action ${action}`);
           const params = action === "secondary_action" ? { ...rest, action: actionName } : rest;
           try {
-            return `__step = ${i + 1}; __what = ${J(action)};\n${actionJs(action, params, t.isTab)}`;
+            const code = actionJs(action, params, t.isTab);
+            return `__step = ${i + 1}; __what = ${J(action)};\n${action === "wait" ? code : act(code)}`;
           } catch (e) {
             throw e instanceof BadInput ? new BadInput(`step ${i + 1} (${action}): ${e.message}`) : e;
           }
@@ -882,8 +953,9 @@ nodeRepl.write(JSON.stringify(__out.slice(0, ${Math.min(limit, 200)}), null, 1) 
       case "open_tab": {
         const url = httpUrl(a.url);
         const fams = await this.browserFamilies(a.browser);
-        // Opened natively (Cmd+T) then attached, because tabs created through the
-        // browser API land in a "ChatGPT" tab group.
+        // Opened with Cmd+T (the engine's createBrowserTab always adds a tab group), navigated
+        // from the address bar, and attached only on the real page: attaching on the browser's
+        // own new-tab page sometimes hung for ~20 s or left the tab with a dead debugger.
         return run(`const __b = (await cua.listBrowsers({ emit: false })).find((b) => !${J(fams)} || ${J(fams)}.includes(b.family));
 if (!__b) throw new Error("no allowed browser is running with the ChatGPT extension connected");
 const __apps = ${J(BROWSER_APPS)};
@@ -893,16 +965,51 @@ ${Session.bindApp("__apps[__b.family]", false)}
 if (!fresh) await tgt.getAXState({ emit: false });
 const __browser = await agent.browsers.get(__b.id);
 const __before = new Set((await __browser.user.openTabs()).map((t) => t.id));
-await tgt.pressKey("super+t");
+// A refused key (the window changed) opened nothing, so look again and retry once.
+for (let __try = 1; ; __try++) {
+  try { await tgt.pressKey("super+t"); break; } catch (e) {
+    if (__try >= 2 || !/changed/i.test(e.message)) throw e;
+    await new Promise((r) => setTimeout(r, 300));
+    await tgt.getAXState({ emit: false });
+  }
+}
 let __new;
-for (let i = 0; i < 40 && !__new; i++) {
-  await new Promise((r) => setTimeout(r, 250));
-  __new = (await __browser.user.openTabs()).find((t) => !__before.has(t.id));
+for (let i = 0; i < 100 && !__new; i++) {
+  await new Promise((r) => setTimeout(r, 100));
+  const __fresh = (await __browser.user.openTabs()).filter((t) => !__before.has(t.id));
+  if (__fresh.length > 1) throw new Error("another tab was opened at the same moment, so open_tab cannot tell which new tab is its own; it typed nothing and left the new tabs open. Retry open_tab");
+  __new = __fresh[0];
 }
 if (!__new) throw new Error("the new tab did not appear");
+// The new tab changed the window, so look again before typing (the engine refuses keys to a
+// changed window). Type only while the new tab is still the focused one: openTabs lists the
+// most recently focused tab first, and the user may have switched tabs meanwhile.
+let __start;
+for (let __try = 1; ; __try++) {
+  await tgt.getAXState({ emit: false });
+  const __now = await __browser.user.openTabs();
+  if (__now[0]?.id !== __new.id) throw new Error("another tab was focused while new tab " + __new.id + " was opening, so the URL was not typed and that empty tab was left open; retry open_tab");
+  __start ??= __now[0].url ?? "";
+  try {
+    await tgt.pressKey("super+l");
+    await tgt.paste(${J(url)}, { format: "text" });
+    await tgt.pressKey("Return");
+    break;
+  } catch (e) {
+    if (__try >= 2 || !/changed/i.test(e.message)) throw e;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+// Done once the tab left its starting page (which may itself be an http(s) homepage).
+const __went = (u) => /^https?:/.test(u) && (u !== __start || u === ${J(url)});
+let __url = "";
+for (let i = 0; i < 150 && !__went(__url); i++) {
+  await new Promise((r) => setTimeout(r, 100));
+  __url = (await __browser.user.openTabs()).find((t) => t.id === __new.id)?.url ?? "";
+}
+if (!__went(__url)) throw new Error("the new tab did not navigate to " + ${J(url)} + " (it is at " + (__url || "an unknown page") + ")");
 const __tab = await cua.getTab(__new.id, { browser: __b.id });
 __C.tabs[__new.id] = __tab;
-await __tab.goto(${J(url)});
 nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
       }
       case "navigate_tab": {
@@ -911,11 +1018,11 @@ nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __t
         if (a.action === "goto") call = `await tgt.goto(${J(httpUrl(a.url))});`;
         else if (["back", "forward", "reload"].includes(a.action)) call = `await tgt.${a.action}();`;
         else throw new BadInput("action must be goto, back, forward or reload");
-        return run(`${t.bind}\n${call}\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
+        return run(`${t.bind}\n${act(call)}\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
       }
       case "close_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
-        return run(`${t.bind}\nawait tgt.close();\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
+        return run(`${t.bind}\n${act("await tgt.close();")}\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
       }
       case "read_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
@@ -937,11 +1044,11 @@ nodeRepl.write(__trunc(__r === undefined ? "undefined" : JSON.stringify(__r, nul
       case "tab_locator": {
         const t = await this.bindTarget(a, { tabOnly: true });
         const { code, read } = locatorJs(a);
-        return run(`${t.bind}\nconst pw = tgt.playwright;\n${code}\n${read ? "" : "await tgt.getAXState();"}`, t, undefined, { trim: !!read });
+        return run(`${t.bind}\nconst pw = tgt.playwright;\n${read ? code : `${act(code)}\nawait tgt.getAXState();`}`, t, undefined, { trim: !!read });
       }
       default: {
         const t = await this.bindTarget(a);
-        return run(`${t.bind}\n${actionJs(name, a, t.isTab)}\nawait tgt.getAXState();`, t);
+        return run(`${t.bind}\n${act(actionJs(name, a, t.isTab))}\nawait tgt.getAXState();`, t);
       }
     }
   }
