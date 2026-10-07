@@ -270,7 +270,6 @@ const FAIL = "[[cub-failed]]";
 const MARK = "[[cub-out]]";
 const DEFAULT_MAX_WIDTH = 1280;
 const DEFAULT_TREE_MAX = 20_000;
-const TAB_GROUP = "🤖 Agent";
 
 const appProp = { type: "string", description: "Bundle ID (e.g. com.brave.Browser) or app name; must be an allowed app." };
 const tabProp = { type: "string", description: "Browser tab ID from list_tabs or open_tab. Give tab instead of app to act inside that tab." };
@@ -392,7 +391,7 @@ const TOOL_DEFS = [
   },
   {
     name: "open_tab",
-    description: `Open a URL in a new tab (in the browser's "${TAB_GROUP}" tab group) and return its tab ID and tree.`,
+    description: "Open a URL in a new ordinary tab (no tab group) and return its tab ID and tree.",
     props: { url: { type: "string" }, browser: { type: "string", description: "Browser app (bundle ID or name); default: the first allowed browser that is running." } },
     required: ["url"],
   },
@@ -912,13 +911,46 @@ nodeRepl.write(JSON.stringify(__out.slice(0, ${Math.min(limit, 200)}), null, 1) 
       case "open_tab": {
         const url = httpUrl(a.url);
         const fams = await this.browserFamilies(a.browser);
-        // The engine's own way to open a tab, as ChatGPT does; its tabs land in a named tab
-        // group. Opening with Cmd+T and attaching to the new-tab page hung or detached.
+        // Opened with Cmd+T (the engine's createBrowserTab always adds a tab group), navigated
+        // from the address bar, and attached only on the real page: attaching on the browser's
+        // own new-tab page sometimes hung for ~20 s or left the tab with a dead debugger.
         return run(`const __b = (await cua.listBrowsers({ emit: false })).find((b) => !${J(fams)} || ${J(fams)}.includes(b.family));
 if (!__b) throw new Error("no allowed browser is running with the ChatGPT extension connected");
-const __tab = await cua.createBrowserTab(__b.family, ${J(url)}, { sessionName: ${J(TAB_GROUP)}, emit: false });
-__C.tabs[__tab.id] = __tab;
-nodeRepl.write("Opened tab " + __tab.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
+const __apps = ${J(BROWSER_APPS)};
+if (!__apps[__b.family]) throw new Error("unsupported browser family " + __b.family);
+${Session.bindApp("__apps[__b.family]", false)}
+// The engine refuses input to a window that changed since its last look, e.g. after the user used the browser.
+if (!fresh) await tgt.getAXState({ emit: false });
+const __browser = await agent.browsers.get(__b.id);
+const __before = new Set((await __browser.user.openTabs()).map((t) => t.id));
+await tgt.pressKey("super+t");
+let __new;
+for (let i = 0; i < 100 && !__new; i++) {
+  await new Promise((r) => setTimeout(r, 100));
+  __new = (await __browser.user.openTabs()).find((t) => !__before.has(t.id));
+}
+if (!__new) throw new Error("the new tab did not appear");
+// The new tab changed the window; look again so the engine accepts the next keys.
+const __type = async () => {
+  await tgt.getAXState({ emit: false });
+  await tgt.pressKey("super+l");
+  await tgt.paste(${J(url)}, { format: "text" });
+  await tgt.pressKey("Return");
+};
+try { await __type(); } catch (e) {
+  if (!/changed/i.test(e.message)) throw e;
+  await new Promise((r) => setTimeout(r, 300));
+  await __type();
+}
+let __url = "";
+for (let i = 0; i < 150 && !/^https?:/.test(__url); i++) {
+  await new Promise((r) => setTimeout(r, 100));
+  __url = (await __browser.user.openTabs()).find((t) => t.id === __new.id)?.url ?? "";
+}
+if (!/^https?:/.test(__url)) throw new Error("the new tab did not navigate to " + ${J(url)} + " (it is at " + (__url || "an unknown page") + ")");
+const __tab = await cua.getTab(__new.id, { browser: __b.id });
+__C.tabs[__new.id] = __tab;
+nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __tab.getAXState({ emit: false, disableDiffing: true }));`, undefined, undefined, { trim: true });
       }
       case "navigate_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });

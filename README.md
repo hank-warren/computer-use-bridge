@@ -284,13 +284,18 @@ ChatGPT's browser extension connected), work on tabs instead of the window:
 
 How tabs are handled, and why:
 
-- `open_tab` uses the engine's own `createBrowserTab`, as ChatGPT does, so
-  agent tabs land in a "🤖 Agent" tab group. Opening with Cmd+T and attaching
-  to the browser's new-tab page sometimes hung for 20 s or left the tab with
-  a dead debugger.
-- The first browser call after an engine starts can take 10-20 s while the
-  engine connects to the browser extension; after that, `open_tab` takes
-  under a second.
+- `open_tab` opens an ordinary tab with Cmd+T, types the URL into the address
+  bar (pasting it through the clipboard, which is restored) and attaches only
+  once the tab is on the real page. It takes about 3 s, or about 6 s as the
+  first browser call of a new engine.
+  - The engine's own `createBrowserTab` (what ChatGPT uses) is faster once warm,
+    but always puts the tab in a tab group, and it took 12-20 s on about one in
+    three new engines.
+  - Attaching while the tab was still on the browser's new-tab page sometimes
+    hung for about 20 s or left the tab with a dead debugger.
+  - It refreshes the window's state before pressing keys, because the engine
+    refuses input to a window that changed since it last looked (e.g. after
+    you used the browser).
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
   and retries the call once. If that fails too, the dead attachment belongs to
   the session's engine (a new engine attaches the same tab fine), so the bridge
