@@ -2,8 +2,8 @@
 class ComputerUseBridge < Formula
   desc "Use ChatGPT's Codex computer use from any MCP client over your tailnet"
   homepage "https://github.com/hank-warren/computer-use-bridge"
-  url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.4.0.tar.gz"
-  sha256 "577902f074a10e907c4a6b08efb147375d961fd871201081f51a6ef8aa0124a1"
+  url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.4.1.tar.gz"
+  sha256 "65d50697f3e4a8be6a3e6412f97ee06cbc2e1f4d3fb0eb95598fb63e360f3128"
   license "MIT"
   head "https://github.com/hank-warren/computer-use-bridge.git", branch: "main"
 
