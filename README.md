@@ -299,16 +299,18 @@ How tabs are handled, and why:
   - It refreshes the window's state before pressing keys, because the engine
     refuses input to a window that changed since it last looked (e.g. after
     you used the browser).
-  - It types only while the new tab is still the focused one. If you switch
-    tabs in that moment, `open_tab` fails and leaves the empty tab open
-    rather than typing the URL into your tab.
+  - It types only while the new tab is still the focused one, and only if it
+    is the only new tab. If you switch or open tabs in that moment, `open_tab`
+    fails and leaves the empty tab open rather than typing into your tab.
+  - If the browser's new-tab page is itself a web page, a URL that redirects
+    back to it is reported as not reached.
 - If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
   the tab; if that fails too, the dead attachment belongs to the session's
   engine (a new engine attaches the same tab fine), so it restarts the engine.
-  It then replays the call only if nothing in it ran yet and it names no
-  element numbers, which belong to the old attachment. Otherwise it returns
-  the tab's fresh tree, or, if the action already ran, says so and asks for
-  `get_state` instead of a repeat.
+  It then replays the call only if no action in it had started and it names
+  no element numbers, which belong to the old attachment. Otherwise it returns
+  the tab's fresh tree and says whether the action ran, may have run, or did
+  not run.
 - A tab attached by one session is locked to it until that session's engine
   stops (`release`, idle stop, or the session closing). If the engine dies
   without that, its tabs can only be closed by hand.

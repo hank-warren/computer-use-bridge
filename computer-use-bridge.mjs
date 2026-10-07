@@ -265,11 +265,15 @@ class CuaChild {
 const BROWSER_APPS = {
   brave: "com.brave.Browser", chrome: "com.google.Chrome", edge: "com.microsoft.edgemac", chromium: "org.chromium.Chromium",
 };
-const FAIL = "[[cub-failed]]";
+// Output markers carry a per-process nonce, so page text cannot pass for one.
+const NONCE = randomBytes(6).toString("hex");
+const FAIL = `[[cub-failed-${NONCE}]]`;
 // Every call writes this, so the bridge can tell its own output from cua_repl's.
-const MARK = "[[cub-out]]";
-// Written once an action has had an effect, so a failed call is not replayed.
-const RAN = "[[cub-ran]]";
+const MARK = `[[cub-out-${NONCE}]]`;
+// Written just before and just after an action with effects, so a failed call is not replayed.
+const START = `[[cub-start-${NONCE}]]`;
+const RAN = `[[cub-ran-${NONCE}]]`;
+const act = (code) => `nodeRepl.write(${J(START)});\n${code}\nnodeRepl.write(${J(RAN)});`;
 const DEFAULT_MAX_WIDTH = 1280;
 const DEFAULT_TREE_MAX = 20_000;
 
@@ -689,7 +693,7 @@ class Session {
     // A block keeps generated bindings out of the persistent REPL scope.
     const res = await (await this.cua()).call("js", { code: `{\n${code}\n}`, timeout_ms: timeoutMs }, timeoutMs + 30_000);
     let failed = !!res.isError;
-    let ran = false;
+    let started = false, ran = false;
     const content = [];
     for (const [i, c] of (res.content ?? []).entries()) {
       if (c.type !== "text") { content.push(c); continue; }
@@ -698,8 +702,9 @@ class Session {
       if (trim && !c.text.includes(MARK) && !(res.isError && i === 0)) continue;
       // error: the thrown message; out: the bridge's own writes; state: a tree cua_repl displayed.
       const kind = res.isError && i === 0 ? "error" : c.text.includes(MARK) ? "out" : "state";
+      if (c.text.includes(START)) started = true;
       if (c.text.includes(RAN)) ran = true;
-      let text = c.text.replaceAll(MARK, "").replaceAll(RAN, "");
+      let text = c.text.replaceAll(MARK, "").replaceAll(START, "").replaceAll(RAN, "");
       if (text.includes(FAIL)) {
         failed = true;
         text = text.replaceAll(FAIL, "");
@@ -709,7 +714,7 @@ class Session {
       if (text.trim()) content.push(Object.defineProperty({ ...c, text }, "kind", { value: kind }));
     }
     const out = { content: content.length ? content : [{ type: "text", text: "ok" }], isError: failed };
-    return Object.defineProperty(out, "ran", { value: ran });
+    return Object.defineProperties(out, { started: { value: started }, ran: { value: ran } });
   }
 
   async resolveApp(app) {
@@ -807,37 +812,48 @@ if (fresh) {
 
   // A tab whose debugger detached stays broken under its cached handle: re-attach it, and
   // if that fails too, restart the engine (a new engine attaches the same tab fine). A call
-  // is replayed only if none of its actions ran and it names no element numbers, which
-  // belong to the old attachment; otherwise the caller gets the tab's fresh tree instead.
+  // is replayed only if no action in it started (START) and it names no element numbers,
+  // which belong to the old attachment; otherwise the caller gets the tab's fresh tree.
   async callFixed(name, a) {
     const detached = (r) => r.isError && /Debugger (unattached|detached|is not attached)/i.test(r.content.map((c) => c.text ?? "").join("\n"));
     const say = (r, text) => { r.content.unshift({ type: "text", text }); return r; };
-    const ranNote = "Your action ran, but the tab's debugger detached before the bridge could read the tree back. Do not repeat the action; call get_state on the tab, which re-attaches it, to see the result.";
-    const res = await this.callFixedOnce(name, a);
-    if (a.tab === undefined || !detached(res)) return res;
-    if (res.ran) return say(res, ranNote);
+    let outcome = await this.callFixedOnce(name, a);
+    if (a.tab === undefined || !detached(outcome)) return outcome;
     const elements = name === "batch"
       ? Array.isArray(a.actions) && a.actions.some((s) => s?.element !== undefined)
       : a.element !== undefined;
-    const attempt = (rebind) => (elements
-      ? this.callFixedOnce("get_state", { tab: a.tab, full: true, rebind })
-      : this.callFixedOnce(name, { ...a, rebind }));
-    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching${elements ? "" : ` and retrying ${name}`}`);
-    let again = await attempt(true);
+    let replay = !outcome.started && !elements;
+    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching${replay ? ` and retrying ${name}` : ""}`);
     let restarted = false;
-    if (detached(again) && !again.ran) {
-      await this.stopEngine("tab debugger stuck");
-      again = await attempt(false);
-      this.notice = null;
-      restarted = true;
+    for (const stage of ["rebind", "restart"]) {
+      if (stage === "restart") {
+        await this.stopEngine("tab debugger stuck");
+        restarted = true;
+      }
+      const rebind = stage === "rebind";
+      const r = replay
+        ? await this.callFixedOnce(name, { ...a, rebind })
+        : await this.callFixedOnce("get_state", { tab: a.tab, full: true, rebind });
+      // The new engine's generic restart notice; the messages here say more.
+      if (restarted) this.notice = null;
+      if (replay) outcome = r;
+      if (!detached(r)) {
+        const how = restarted ? "the bridge restarted the engine to re-attach it" : "the bridge re-attached it";
+        const others = restarted ? " Other tabs and windows of this session were re-attached too, so call get_state before using their element numbers." : "";
+        if (replay) return say(r, `The tab's debugger had detached; ${how} and retried.${others}`);
+        r.isError = !outcome.ran;
+        return say(r, `${outcome.ran
+          ? `Your ${name} ran, but the tab's debugger detached before the bridge could read the tree back; ${how}. Do not repeat it.`
+          : outcome.started
+            ? `The tab's debugger detached while your ${name} was running, so it may or may not have taken effect; ${how}. Check the tree before retrying.`
+            : `The tab's debugger had detached; ${how}. Your ${name} did NOT run, because its element numbers belonged to the old attachment; choose elements from this tree and call ${name} again.`
+        } The tab's current tree follows.${others}`);
+      }
+      // A replay that got as far as starting its action must not be replayed again.
+      if (replay && r.started) replay = false;
     }
-    if (again.ran && detached(again)) return say(again, ranNote);
-    if (detached(again)) return say(again, "The tab's debugger had detached and even a new engine could not re-attach it; open the page in a new tab with open_tab.");
-    const how = restarted ? "the bridge restarted the engine to re-attach it" : "the bridge re-attached it";
-    const others = restarted ? " Other tabs and windows of this session were re-attached too, so call get_state before using their element numbers." : "";
-    if (!elements) return say(again, `The tab's debugger had detached; ${how} and retried.${others}`);
-    again.isError = true;
-    return say(again, `The tab's debugger had detached; ${how}. Your ${name} did NOT run, because its element numbers belonged to the old attachment. The tab's current tree follows; choose elements from it and call ${name} again.${others}`);
+    const what = outcome.ran ? `Your ${name} ran, but the` : outcome.started ? `Your ${name} may or may not have taken effect: the` : "The";
+    return say(outcome, `${what} tab's debugger detached and even a new engine could not re-attach it; open the page in a new tab with open_tab.`);
   }
 
   async callFixedOnce(name, a) {
@@ -847,14 +863,18 @@ if (fresh) {
     // Screenshots are downscaled here; the factor maps the client's coordinates back.
     const run = async (body, t, timeoutMs, { trim = false } = {}) => {
       const res = await this.js(`${prelude(t ? (this.scales.get(t.key) ?? 1) : 1)}\n${body}`, timeoutMs, { trim });
-      // Only trees are capped: cua_repl's displayed states, and open_tab's own write of one.
+      // Only trees are capped: cua_repl's displayed states, and open_tab's own write of one,
+      // whose first line ("Opened tab N") is kept whole.
       for (const c of res.content) {
         if (!cap || c.type !== "text" || c.text.length <= cap) continue;
         if (c.kind !== "state" && !(c.kind === "out" && name === "open_tab")) continue;
-        let cut = c.text.lastIndexOf("\n", cap);
-        if (cut < cap * 0.8) cut = /[\uD800-\uDBFF]/.test(c.text[cap - 1]) ? cap - 1 : cap;
+        const head = c.kind === "out" ? c.text.indexOf("\n") + 1 : 0;
+        const tree = c.text.slice(head);
+        if (tree.length <= cap) continue;
+        let cut = tree.lastIndexOf("\n", cap);
+        if (cut < cap * 0.8) cut = /[\uD800-\uDBFF]/.test(tree[cap - 1]) ? cap - 1 : cap;
         const more = t?.isTab || name === "open_tab" ? "; for page content use read_tab or tab_locator" : "";
-        c.text = `${c.text.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${c.text.length} characters. Elements after this point exist but are not listed. To see them, call get_state with full: true and a larger max_chars (0 for no limit)${more}.]`;
+        c.text = `${c.text.slice(0, head)}${tree.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${tree.length} characters. Elements after this point exist but are not listed. To see them, call get_state with full: true and a larger max_chars (0 for no limit)${more}.]`;
       }
       for (const [i, c] of [...res.content.entries()]) {
         if (c.type !== "image") continue;
@@ -902,7 +922,8 @@ ${shot}`, t);
           if (action !== "wait" && !ACTIONS[action]) throw new BadInput(`step ${i + 1}: unknown action ${action}`);
           const params = action === "secondary_action" ? { ...rest, action: actionName } : rest;
           try {
-            return `__step = ${i + 1}; __what = ${J(action)};\n${actionJs(action, params, t.isTab)}${action === "wait" ? "" : `\nnodeRepl.write(${J(RAN)});`}`;
+            const code = actionJs(action, params, t.isTab);
+            return `__step = ${i + 1}; __what = ${J(action)};\n${action === "wait" ? code : act(code)}`;
           } catch (e) {
             throw e instanceof BadInput ? new BadInput(`step ${i + 1} (${action}): ${e.message}`) : e;
           }
@@ -944,11 +965,20 @@ ${Session.bindApp("__apps[__b.family]", false)}
 if (!fresh) await tgt.getAXState({ emit: false });
 const __browser = await agent.browsers.get(__b.id);
 const __before = new Set((await __browser.user.openTabs()).map((t) => t.id));
-await tgt.pressKey("super+t");
+// A refused key (the window changed) opened nothing, so look again and retry once.
+for (let __try = 1; ; __try++) {
+  try { await tgt.pressKey("super+t"); break; } catch (e) {
+    if (__try >= 2 || !/changed/i.test(e.message)) throw e;
+    await new Promise((r) => setTimeout(r, 300));
+    await tgt.getAXState({ emit: false });
+  }
+}
 let __new;
 for (let i = 0; i < 100 && !__new; i++) {
   await new Promise((r) => setTimeout(r, 100));
-  __new = (await __browser.user.openTabs()).find((t) => !__before.has(t.id));
+  const __fresh = (await __browser.user.openTabs()).filter((t) => !__before.has(t.id));
+  if (__fresh.length > 1) throw new Error("another tab was opened at the same moment, so open_tab cannot tell which new tab is its own; it typed nothing and left the new tabs open. Retry open_tab");
+  __new = __fresh[0];
 }
 if (!__new) throw new Error("the new tab did not appear");
 // The new tab changed the window, so look again before typing (the engine refuses keys to a
@@ -988,11 +1018,11 @@ nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __t
         if (a.action === "goto") call = `await tgt.goto(${J(httpUrl(a.url))});`;
         else if (["back", "forward", "reload"].includes(a.action)) call = `await tgt.${a.action}();`;
         else throw new BadInput("action must be goto, back, forward or reload");
-        return run(`${t.bind}\n${call}\nnodeRepl.write(${J(RAN)});\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
+        return run(`${t.bind}\n${act(call)}\nnodeRepl.write("Now at " + (await tgt.url()) + "\\n");\nawait tgt.getAXState({ disableDiffing: true });`, t);
       }
       case "close_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
-        return run(`${t.bind}\nawait tgt.close();\nnodeRepl.write(${J(RAN)});\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
+        return run(`${t.bind}\n${act("await tgt.close();")}\ndelete __C.tabs[${J(a.tab)}];\nnodeRepl.write("Closed tab " + ${J(a.tab)});`, t, undefined, { trim: true });
       }
       case "read_tab": {
         const t = await this.bindTarget(a, { tabOnly: true });
@@ -1009,17 +1039,16 @@ nodeRepl.write("Opened tab " + __new.id + " in " + __b.name + ".\\n" + await __t
         const max = a.max_chars === undefined ? 20_000 : int(a.max_chars, "max_chars");
         return run(`${t.bind}
 const __r = await tgt.playwright.evaluate(${J(str(a.expression, "expression", 20_000))});
-nodeRepl.write(${J(RAN)});
 nodeRepl.write(__trunc(__r === undefined ? "undefined" : JSON.stringify(__r, null, 1) ?? String(__r), ${max}));`, t, undefined, { trim: true });
       }
       case "tab_locator": {
         const t = await this.bindTarget(a, { tabOnly: true });
         const { code, read } = locatorJs(a);
-        return run(`${t.bind}\nconst pw = tgt.playwright;\n${code}\n${read ? "" : `nodeRepl.write(${J(RAN)});\nawait tgt.getAXState();`}`, t, undefined, { trim: !!read });
+        return run(`${t.bind}\nconst pw = tgt.playwright;\n${read ? code : `${act(code)}\nawait tgt.getAXState();`}`, t, undefined, { trim: !!read });
       }
       default: {
         const t = await this.bindTarget(a);
-        return run(`${t.bind}\n${actionJs(name, a, t.isTab)}\nnodeRepl.write(${J(RAN)});\nawait tgt.getAXState();`, t);
+        return run(`${t.bind}\n${act(actionJs(name, a, t.isTab))}\nawait tgt.getAXState();`, t);
       }
     }
   }
