@@ -1,7 +1,7 @@
 // computer-use-bridge: expose ChatGPT.app's Codex computer-use engine (cua_repl) to
 // other MCP clients, over stdio or bearer-authenticated streamable HTTP.
 //
-//   computer-use-bridge setup [--host IP|tailscale|localhost] [--port N] [--allow IDS] [--yes] [--no-service]
+//   computer-use-bridge setup [--host IP|tailscale|localhost] [--tunnel HOST[:PORT],...] [--port N] [--allow IDS] [--yes] [--no-service]
 //   computer-use-bridge status [--config FILE]
 //   computer-use-bridge stdio [--raw] [--approve-all] [--config FILE]
 //   computer-use-bridge serve [--config FILE]
@@ -16,7 +16,7 @@
 // Unofficial: relies on ChatGPT.app internals that an update can change.
 
 import { execFile, spawn } from "node:child_process";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -25,7 +25,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const PLUGIN_DIR = join(homedir(), ".codex/plugins/cache/openai-bundled/unified-computer-use");
 const NAME = "computer-use-bridge";
@@ -53,7 +53,8 @@ const expand = (p) => (p?.startsWith("~/") ? join(homedir(), p.slice(2)) : p);
 const USAGE = `usage: ${NAME} <command>
 
   setup    configure the HTTP server for this Mac and start it (interactive)
-           [--host IP|tailscale|localhost] [--port N] [--allow ID,ID] [--yes] [--no-service]
+           [--host IP|tailscale|localhost] [--tunnel HOST[:PORT],...] [--port N] [--allow ID,ID]
+           [--yes] [--no-service]
   status   check the engine, the config and the running server
   update   upgrade through Homebrew and restart the service
   serve    run the HTTP server (what the Homebrew service runs)
@@ -77,6 +78,7 @@ function parseArgs(argv) {
     else if (a === "--approve-all" && mode === "stdio") opts.approveAll = true;
     else if (a === "--config") opts.config = value(i++);
     else if (mode === "setup" && a === "--host") opts.host = value(i++);
+    else if (mode === "setup" && a === "--tunnel") opts.tunnel = value(i++);
     else if (mode === "setup" && a === "--port") opts.port = value(i++);
     else if (mode === "setup" && a === "--allow") opts.allow = value(i++);
     else if (mode === "setup" && (a === "--yes" || a === "-y")) opts.yes = true;
@@ -87,12 +89,20 @@ function parseArgs(argv) {
   return opts;
 }
 
+// A reverse tunnel: ssh is a host alias or user@host, as typed after `ssh`.
+function checkTunnel(t) {
+  if (typeof t?.ssh !== "string" || !/^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,252}$/.test(t.ssh)) throw new Error(`tunnel ssh must be a host or user@host (got ${JSON.stringify(t?.ssh)})`);
+  if (!Number.isInteger(t.remotePort) || t.remotePort < 1024 || t.remotePort > 65535) throw new Error(`tunnel ${t.ssh}: remotePort must be 1024-65535`);
+  return { ssh: t.ssh, remotePort: t.remotePort };
+}
+
 function loadConfig(opts) {
   const file = expand(opts.config);
   const cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
   if (opts.mode === "serve") {
     if (!cfg.host || !cfg.port || !cfg.tokenFile) throw new Error(`${file} needs host, port and tokenFile; run "${NAME} setup"`);
     if (cfg.surface === "raw" || cfg.approve === "all") throw new Error("serve only supports the fixed surface with the allowlist");
+    cfg.tunnels = (cfg.tunnels ?? []).map(checkTunnel);
     cfg.surface = "fixed";
     cfg.approve = "allowlist";
   } else {
@@ -775,7 +785,22 @@ if (fresh) {
     return w;
   }
 
+  // A tab whose debugger detached stays broken under its cached handle, so re-attach
+  // and retry once. Batches only retry when nothing ran yet (stopped at step 1).
   async callFixed(name, a) {
+    const res = await this.callFixedOnce(name, a);
+    const text = res.isError && a.tab !== undefined ? res.content.filter((c) => c.type === "text").map((c) => c.text).join("\n") : "";
+    if (!/Debugger (unattached|detached|is not attached)/i.test(text)) return res;
+    if (name === "batch" && /Batch stopped at step (?!1 )\d+/.test(text)) return res;
+    log(`[${this.label}] tab ${a.tab}: debugger detached; re-attaching and retrying ${name}`);
+    const again = await this.callFixedOnce(name, { ...a, rebind: true });
+    again.content.unshift({ type: "text", text: again.isError
+      ? "The tab's debugger had detached and re-attaching did not help; open the page in a new tab with open_tab."
+      : "The tab's debugger had detached; the bridge re-attached it and retried." });
+    return again;
+  }
+
+  async callFixedOnce(name, a) {
     if (!this.tools.some((t) => t.name === name)) throw new BadInput(`unknown tool ${name}`);
     const maxWidth = this.maxWidth(a);
     // Screenshots are downscaled here; the factor maps the client's coordinates back.
@@ -864,6 +889,8 @@ if (!__b) throw new Error("no allowed browser is running with the ChatGPT extens
 const __apps = ${J(BROWSER_APPS)};
 if (!__apps[__b.family]) throw new Error("unsupported browser family " + __b.family);
 ${Session.bindApp("__apps[__b.family]", false)}
+// The engine refuses input to a window that changed since its last look, e.g. after the user used the browser.
+if (!fresh) await tgt.getAXState({ emit: false });
 const __browser = await agent.browsers.get(__b.id);
 const __before = new Set((await __browser.user.openTabs()).map((t) => t.id));
 await tgt.pressKey("super+t");
@@ -971,6 +998,66 @@ function runStdio(cfg) {
   for (const sig of ["SIGHUP", "SIGTERM", "SIGINT"]) process.on(sig, shutdown);
 }
 
+// Keeps `ssh -R` open so a machine this Mac can SSH to, but that cannot reach this
+// Mac (e.g. a VM behind a one-way VPN like WARP), reaches the server on its own loopback.
+const SSH_TUNNEL_OPTS = [
+  "-N", "-T", "-v", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=15",
+  "-o", "ServerAliveCountMax=3", "-o", "ConnectTimeout=20", "-o", "RemoteCommand=none", "-o", "RequestTTY=no",
+  // A shared ControlMaster connection would hand the forward to the master and exit.
+  "-o", "ControlMaster=no", "-o", "ControlPath=none",
+];
+
+class Tunnel {
+  constructor(t, cfg) {
+    Object.assign(this, t);
+    this.forward = `127.0.0.1:${t.remotePort}:${cfg.host}:${cfg.port}`;
+    this.label = `tunnel ${t.ssh}:${t.remotePort}`;
+    this.up = false;
+    this.error = "starting";
+    this.delay = 2000;
+    this.stopped = false;
+  }
+
+  start() {
+    if (this.stopped) return;
+    const started = Date.now();
+    let buf = "";
+    let lastDebug = "";
+    this.proc = spawn("/usr/bin/ssh", [...SSH_TUNNEL_OPTS, "-R", this.forward, this.ssh], { stdio: ["ignore", "ignore", "pipe"] });
+    createInterface({ input: this.proc.stderr }).on("line", (line) => {
+      if (/remote forward success/.test(line) && !this.up) {
+        this.up = true;
+        this.error = null;
+        log(`[${this.label}] up`);
+      } else if (!line.trim() || /^(Transferred:|Bytes per second:)/.test(line)) return;
+      else if (line.startsWith("debug")) lastDebug = line.trim();
+      else buf = line.trim();
+    });
+    this.proc.on("error", (e) => { buf = e.message; });
+    this.proc.on("close", (code, sig) => {
+      const was = this.up;
+      this.up = false;
+      this.proc = null;
+      if (this.stopped) return;
+      if (Date.now() - started > 60_000) this.delay = 2000;
+      this.error = buf || `ssh exited (${code ?? sig}) after: ${lastDebug || "no output"}`;
+      log(`[${this.label}] ${was ? "down" : "failed"}: ${this.error}; retrying in ${this.delay / 1000}s`);
+      this.retry = setTimeout(() => this.start(), this.delay);
+      this.delay = Math.min(this.delay * 2, 60_000);
+    });
+  }
+
+  stop() {
+    this.stopped = true;
+    clearTimeout(this.retry);
+    this.proc?.kill("SIGTERM");
+  }
+
+  state() {
+    return { ssh: this.ssh, remotePort: this.remotePort, up: this.up, error: this.error };
+  }
+}
+
 function runHttp(cfg) {
   const token = Buffer.from(readFileSync(expand(cfg.tokenFile), "utf8").trim());
   if (token.length < 32) throw new Error("token must be at least 32 characters");
@@ -1001,7 +1088,10 @@ function runHttp(cfg) {
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://x");
-    if (url.pathname === "/healthz" && req.method === "GET") return reply(res, 200, { ok: true, version: VERSION });
+    if (url.pathname === "/healthz" && req.method === "GET") {
+      // Tunnel details only with the token: tunneled requests look local, so the address proves nothing.
+      return reply(res, 200, { ok: true, version: VERSION, ...(authorized(req) && tunnels.length ? { tunnels: tunnels.map((t) => t.state()) } : {}) });
+    }
     if (url.pathname !== "/mcp") return reply(res, 404, rpcError(-32000, "not found"));
     if (req.headers.origin) return reply(res, 403, rpcError(-32000, "browser origins are not allowed"));
     if (!authorized(req)) {
@@ -1046,9 +1136,14 @@ function runHttp(cfg) {
     return reply(res, 200, out, headers);
   });
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
-  server.listen(cfg.port, cfg.host, () => log(`serving fixed surface on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ")}`));
+  const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
+  server.listen(cfg.port, cfg.host, () => {
+    log(`serving fixed surface on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ")}`);
+    for (const t of tunnels) t.start();
+  });
   const stop = async () => {
     setTimeout(() => process.exit(0), 15_000).unref();
+    for (const t of tunnels) t.stop();
     await Promise.allSettled([...sessions.keys()].map((sid) => closeSession(sid, "shutdown")));
     process.exit(0);
   };
@@ -1085,7 +1180,7 @@ const inRange = (ip, [base, bits]) => {
   return (n(ip) & mask) >>> 0 === (n(base) & mask) >>> 0;
 };
 
-// Tailscale's IPv4: from its CLI, or the CGNAT-range address on a tunnel interface.
+// Tailscale's IPv4 from its CLI. Not guessed from interfaces: other VPNs (e.g. WARP) use the same range.
 async function tailscaleIp() {
   for (const cli of ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]) {
     if (!existsSync(cli)) continue;
@@ -1093,16 +1188,14 @@ async function tailscaleIp() {
     const ip = r.stdout.trim().split("\n")[0];
     if (r.ok && /^\d+\.\d+\.\d+\.\d+$/.test(ip)) return ip;
   }
-  for (const [name, addrs] of Object.entries(networkInterfaces())) {
-    const a = (addrs ?? []).find((x) => x.family === "IPv4" && inRange(x.address, ["100.64.0.0", 10]));
-    if (a && name.startsWith("utun")) return a.address;
-  }
   return null;
 }
 
+// Private addresses on physical interfaces; VPN tunnels (utun, ipsec, ppp) are skipped.
 function lanIps() {
   const out = [];
   for (const [name, addrs] of Object.entries(networkInterfaces())) {
+    if (/^(utun|ipsec|ppp|gif|stf)/.test(name)) continue;
     for (const a of addrs ?? []) {
       if (a.family !== "IPv4" || a.internal) continue;
       if ([["10.0.0.0", 8], ["172.16.0.0", 12], ["192.168.0.0", 16]].some((r) => inRange(a.address, r))) out.push({ ip: a.address, name });
@@ -1127,11 +1220,13 @@ function brewPath() {
   return null;
 }
 
-async function health(host, port, waitMs = 0) {
+async function health(host, port, waitMs = 0, tokenFile) {
   const until = Date.now() + waitMs;
+  let headers = {};
+  try { if (tokenFile) headers = { Authorization: `Bearer ${readFileSync(expand(tokenFile), "utf8").trim()}` }; } catch {}
   for (;;) {
     try {
-      const r = await fetch(`http://${host}:${port}/healthz`, { signal: AbortSignal.timeout(2000) });
+      const r = await fetch(`http://${host}:${port}/healthz`, { headers, signal: AbortSignal.timeout(2000) });
       if (r.ok) return await r.json();
     } catch {}
     if (Date.now() >= until) return null;
@@ -1155,25 +1250,43 @@ async function probeEngine() {
   }
 }
 
+const macName = () => hostname().split(".")[0].toLowerCase();
+
+const clientConfigs = (mac, url, tokenPath) => `   pi (~/.pi/agent/mcp.json, under "mcpServers"):
+     "${mac}-cu": {
+       "url": "${url}",
+       "headers": { "Authorization": "!echo Bearer $(cat ${tokenPath})" },
+       "timeout": 120
+     }
+
+   Claude Code:
+     claude mcp add --transport http ${mac}-cu ${url} --header "Authorization: Bearer $(cat ${tokenPath})"`;
+
 function clientHelp(cfg) {
-  const url = `http://${cfg.host}:${cfg.port}/mcp`;
-  const mac = hostname().replace(/\.local$/, "").toLowerCase();
+  const mac = macName();
   const tokenName = `${mac}.token`;
+  if (cfg.tunnels?.length) {
+    for (const t of cfg.tunnels) {
+      say(`
+On ${t.ssh}, connect clients to http://127.0.0.1:${t.remotePort}/mcp (through the tunnel)
+
+1. The token goes in ~/.config/${NAME}/${tokenName} there. To copy it again from this Mac:
+     ssh ${t.ssh} 'umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${tokenName}' < ${cfg.tokenFile}
+
+2. Client configuration on ${t.ssh}:
+${clientConfigs(mac, `http://127.0.0.1:${t.remotePort}/mcp`, `~/.config/${NAME}/${tokenName}`)}`);
+    }
+    return;
+  }
+  const url = `http://${cfg.host}:${cfg.port}/mcp`;
   say(`
 Connect a client to ${url}
 
 1. Copy the token to the client without printing it, e.g. from the client:
      ssh ${mac} 'cat ${cfg.tokenFile}' | (umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${tokenName})
 
-2. pi (~/.pi/agent/mcp.json, under "mcpServers"):
-     "${mac}-cu": {
-       "url": "${url}",
-       "headers": { "Authorization": "!echo Bearer $(cat ~/.config/${NAME}/${tokenName})" },
-       "timeout": 120
-     }
-
-   Claude Code:
-     claude mcp add --transport http ${mac}-cu ${url} --header "Authorization: Bearer $(cat ~/.config/${NAME}/${tokenName})"
+2. Client configuration:
+${clientConfigs(mac, url, `~/.config/${NAME}/${tokenName}`)}
 
    Over SSH instead of HTTP (stdio):
      ssh -T ${mac} ${brewPath() ? join(dirname(brewPath()), NAME) : NAME} stdio`);
@@ -1182,7 +1295,13 @@ Connect a client to ${url}
 async function setup(opts) {
   const file = expand(opts.config);
   const interactive = !opts.yes && process.stdin.isTTY;
-  const rl = interactive ? createPrompt({ input: process.stdin, output: process.stdout }) : null;
+  const prompt = () => createPrompt({ input: process.stdin, output: process.stdout });
+  let rl = interactive ? prompt() : null;
+  // Hands the terminal to a child (e.g. ssh asking to accept a host key), then takes it back.
+  const withTerminal = async (fn) => {
+    rl.close();
+    try { return await fn(); } finally { rl = prompt(); }
+  };
   const ask = async (q, def) => {
     if (!rl) return def;
     const a = (await rl.question(`${q}${def !== undefined && def !== "" ? ` [${def}]` : ""}: `)).trim();
@@ -1219,31 +1338,53 @@ async function setup(opts) {
 
     const cfg = existsSync(file) ? readJson(file) : {};
 
-    // Where to listen.
+    // Where clients connect: an address of this Mac, or a reverse tunnel to machines that cannot reach it.
     const ts = await tailscaleIp();
     const lans = lanIps();
     let host = opts.host;
+    let tunnelMode = opts.tunnel !== undefined;
     if (host === "tailscale") host = ts ?? (() => { throw new Error("Tailscale is not connected on this Mac"); })();
     if (host === "localhost") host = "127.0.0.1";
-    if (!host) {
+    if (!host && !tunnelMode) {
       const choices = [];
       if (ts) choices.push({ ip: ts, label: "Tailscale (recommended: only your tailnet can reach it, and traffic is encrypted)" });
       for (const l of lans) choices.push({ ip: l.ip, label: `local network on ${l.name} (plain HTTP: anyone on this network can see traffic and the token)` });
-      choices.push({ ip: "127.0.0.1", label: "this Mac only (clients over SSH tunnels)" });
-      const current = choices.findIndex((c) => c.ip === cfg.host);
-      if (cfg.host && current < 0) choices.unshift({ ip: cfg.host, label: "current config (not an address of this Mac right now)" });
-      say("\nListen on:");
-      choices.forEach((c, i) => say(`  ${i + 1}) ${c.ip}  ${c.label}`));
-      const def = Math.max(0, choices.findIndex((c) => c.ip === cfg.host)) + 1;
+      choices.push({ ip: "127.0.0.1", label: "this Mac only (local clients)" });
+      choices.push({ tunnel: true, label: "a remote machine over SSH: for a VM you can SSH into but that cannot reach this Mac (e.g. over WARP); this Mac keeps a reverse tunnel open" });
+      if (cfg.host && !cfg.tunnels?.length && !choices.some((c) => c.ip === cfg.host)) choices.unshift({ ip: cfg.host, label: "current config (not an address of this Mac right now)" });
+      if (rl) {
+        say("\nHow will clients connect?");
+        choices.forEach((c, i) => say(`  ${i + 1}) ${c.ip ? `${c.ip}  ` : ""}${c.label}`));
+      }
+      const def = (cfg.tunnels?.length ? choices.findIndex((c) => c.tunnel) : Math.max(0, choices.findIndex((c) => c.ip === cfg.host))) + 1;
       const pick = String(await ask("Choose a number or type an IPv4 address", String(def)));
-      host = /^\d+$/.test(pick) ? choices[Number(pick) - 1]?.ip : pick;
-      if (!host) throw new Error("no such choice");
+      const choice = /^\d+$/.test(pick) ? choices[Number(pick) - 1] : { ip: pick };
+      if (!choice) throw new Error("no such choice");
+      tunnelMode = !!choice.tunnel;
+      host = choice.ip;
     }
+    if (tunnelMode) host = "127.0.0.1";
     if (!/^\d+\.\d+\.\d+\.\d+$/.test(host)) throw new Error(`host must be an IPv4 address, tailscale or localhost (got ${host})`);
     if (lans.some((l) => l.ip === host)) say("Warning: the local network sees plain HTTP. Prefer Tailscale for anything but a trusted home network.");
 
     const port = Number(opts.port ?? await ask("Port", String(cfg.port ?? DEFAULT_PORT)));
     if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error("port must be 1024-65535");
+
+    const tunnels = [];
+    if (tunnelMode) {
+      const existing = new Map((cfg.tunnels ?? []).map((t) => [t.ssh, t.remotePort]));
+      const spec = opts.tunnel ?? await ask("\nSSH host(s) to open the tunnel to, as you would type after ssh (comma-separated)", [...existing.keys()].join(","));
+      for (const part of String(spec ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+        const [ssh, p] = part.split(":");
+        let remotePort = p ? Number(p) : existing.get(ssh);
+        if (!remotePort) {
+          const def = String(47801 + randomInt(199));
+          remotePort = Number(opts.tunnel !== undefined ? def : await ask(`Port to open on ${ssh} (its other users must not be using it)`, def));
+        }
+        tunnels.push(checkTunnel({ ssh, remotePort }));
+      }
+      if (!tunnels.length) throw new Error("give at least one SSH host for the tunnel");
+    }
 
     // Which apps clients may control.
     let allow = opts.allow?.split(",").map((s) => s.trim()).filter(Boolean);
@@ -1266,7 +1407,24 @@ async function setup(opts) {
     }
     chmodSync(tokenFile, 0o600);
 
+    for (const t of tunnels) {
+      say(`\nChecking that this Mac can log in to ${t.ssh} without prompts (the service runs in the background)...`);
+      const err = await checkSsh(t.ssh, rl && withTerminal);
+      if (err) {
+        say(`Login to ${t.ssh} failed: ${err}\nThe tunnel needs key login without prompts: use an SSH key, and if it has a passphrase, store it in the Keychain (UseKeychain yes and AddKeysToAgent yes in ~/.ssh/config). Then run setup again.`);
+        continue;
+      }
+      say("Login OK.");
+      const mac = macName();
+      if (await confirm(`Copy the token to ${t.ssh} now (~/.config/${NAME}/${mac}.token there)?`)) {
+        const r = await sshWrite(t.ssh, `umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${mac}.token`, readFileSync(tokenFile));
+        say(r ? `Copying failed: ${r}` : "Token copied.");
+      }
+    }
+
     Object.assign(cfg, { host, port, tokenFile, allowApps: allow });
+    if (tunnels.length) cfg.tunnels = tunnels;
+    else delete cfg.tunnels;
     cfg.idleMinutes ??= 30;
     cfg.maxSessions ??= 4;
     cfg.engineIdleMinutes ??= 10;
@@ -1288,10 +1446,47 @@ async function setup(opts) {
     }
     const h = opts.service && managed ? await health(host, port, 15_000) : await health(host, port);
     say(h ? `Listening on http://${host}:${port}/mcp (version ${h.version})` : `Not answering on http://${host}:${port} yet; see "${NAME} status".`);
+    if (h && tunnels.length) {
+      let states = [];
+      for (let i = 0; i < 25; i++) {
+        states = (await health(host, port, 0, tokenFile))?.tunnels ?? [];
+        if (states.length && states.every((s) => s.up)) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      for (const s of states) say(s.up ? `Tunnel to ${s.ssh} is up: port ${s.remotePort} there reaches this server.` : `Tunnel to ${s.ssh} is not up yet: ${s.error}. It keeps retrying; see "${NAME} status".`);
+    }
     clientHelp(cfg);
   } finally {
     rl?.close();
   }
+}
+
+const lastLine = (s) => s.trim().split("\n").filter((l) => l.trim() && !l.startsWith("debug")).at(-1) ?? "";
+const SSH_CHECK_OPTS = ["-o", "ConnectTimeout=15", "-o", "RemoteCommand=none", "-o", "RequestTTY=no", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
+
+// Checks key login without prompts; if it fails and setup is interactive, connects
+// once interactively first (to accept a new host key or unlock a key).
+async function checkSsh(dest, withTerminal) {
+  const batch = () => run("/usr/bin/ssh", ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, "true"], 30_000);
+  let r = await batch();
+  if (!r.ok && withTerminal) {
+    say(`Background login failed (${lastLine(r.stderr) || "no error"}). Connecting interactively once, e.g. to accept its host key:`);
+    await withTerminal(() => new Promise((res) => spawn("/usr/bin/ssh", [...SSH_CHECK_OPTS, dest, "true"], { stdio: "inherit" }).on("exit", res)));
+    r = await batch();
+  }
+  return r.ok ? null : lastLine(r.stderr) || `ssh exited ${r.code}`;
+}
+
+// Runs a command over SSH with data on its stdin; returns an error message or null.
+function sshWrite(dest, command, data) {
+  return new Promise((resolve) => {
+    const p = spawn("/usr/bin/ssh", ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, command], { stdio: ["pipe", "ignore", "pipe"] });
+    let err = "";
+    p.stderr.on("data", (d) => { err += d; });
+    p.on("error", (e) => resolve(e.message));
+    p.on("close", (code) => resolve(code === 0 ? null : lastLine(err) || `ssh exited ${code}`));
+    p.stdin.end(data);
+  });
 }
 
 // brew upgrade does not restart services, so this does both.
@@ -1322,6 +1517,7 @@ async function status(opts) {
     line(true, `config: ${file}`);
     line(tokenOk, `token: ${cfg.tokenFile}`);
     say(`      listen http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ") || "(none)"}; engine idle stop: ${cfg.engineIdleMinutes || "off"} min`);
+    for (const t of cfg.tunnels) say(`      tunnel to ${t.ssh}, port ${t.remotePort} there`);
   } catch (e) { line(false, `config: ${e.message}`); }
   const brew = brewPath();
   if (brew) {
@@ -1332,8 +1528,9 @@ async function status(opts) {
   }
   if (existsSync(LEGACY_PLIST)) line(false, `old LaunchAgent still installed (${LEGACY.label}); run "${NAME} setup" to remove it`);
   if (cfg) {
-    const h = await health(cfg.host, cfg.port);
+    const h = await health(cfg.host, cfg.port, 0, cfg.tokenFile);
     line(!!h, h ? `server: answering, version ${h.version}${h.version !== VERSION ? " (restart the service to run this version)" : ""}` : `server: not answering on ${cfg.host}:${cfg.port}`);
+    for (const t of h?.tunnels ?? []) line(t.up, `tunnel: ${t.ssh} port ${t.remotePort} ${t.up ? "up" : `down: ${t.error}`}`);
   }
   const probe = await probeEngine();
   line(probe.ok, `engine probe: ${probe.detail}`);

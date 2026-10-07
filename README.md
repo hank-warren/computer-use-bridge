@@ -13,8 +13,10 @@ automatically, but a ChatGPT update can change the internals and break it.
 ## Install
 
 On the Mac whose apps you want to control. You need ChatGPT.app with Computer
-Use set up in Codex (its permissions granted), and Tailscale if clients on
-other machines should connect.
+Use set up in Codex (its permissions granted). ChatGPT has to be installed but
+not running; see [Screen indicators](#screen-indicators). Clients on other
+machines connect over Tailscale, or over a reverse SSH tunnel when they cannot
+reach this Mac.
 
 ```bash
 brew tap hank-warren/computer-use-bridge https://github.com/hank-warren/computer-use-bridge
@@ -25,10 +27,15 @@ computer-use-bridge setup
 
 `setup` walks you through:
 
-1. **Where to listen.** Your Tailscale address (recommended: only your tailnet
-   can reach it, and traffic is encrypted), a local-network address (plain
-   HTTP, so anyone on that network can see requests and the token; use it only
-   on a network you trust) or `127.0.0.1` (clients reach it over SSH tunnels).
+1. **How clients connect.**
+   - Your Tailscale address (recommended: only your tailnet can reach it, and
+     traffic is encrypted).
+   - A local-network address: plain HTTP, so anyone on that network can see
+     requests and the token. Use it only on a network you trust.
+   - `127.0.0.1`, for clients on this Mac.
+   - A remote machine over SSH, for a VM you can SSH into but that cannot
+     reach this Mac, such as one behind Cloudflare WARP or another one-way
+     VPN. See [Remote machines over SSH](#remote-machines-over-ssh).
 2. **The port** (default 47800).
 3. **Which apps clients may control**, as bundle IDs. It lists the supported
    browsers and chat apps it finds.
@@ -38,7 +45,8 @@ checks that the engine works, starts the Homebrew service (which also starts at
 login), and prints the client configuration for pi and Claude Code.
 
 Run it again at any time to change these settings. For scripts:
-`computer-use-bridge setup --host tailscale --port 47800 --allow com.brave.Browser,com.hnc.Discord --yes`.
+`computer-use-bridge setup --host tailscale --port 47800 --allow com.brave.Browser,com.hnc.Discord --yes`,
+or `--tunnel devvm:47801` instead of `--host` for the SSH tunnel.
 
 ### Update
 
@@ -139,6 +147,7 @@ the allowlist.
 | `idleMinutes` | Close an MCP session after this long without a request. |
 | `maxSessions` | Evict the least recently used session beyond this many. |
 | `engineIdleMinutes` | Stop a session's engine after this long without a call (0 never stops it). See below. |
+| `tunnels` | Reverse SSH tunnels, e.g. `[{"ssh": "devvm", "remotePort": 47801}]`. See [Remote machines over SSH](#remote-machines-over-ssh). |
 | `screenshotMaxWidth` | Downscale screenshots to this width (default 1280; 0 keeps full size). |
 | `tabEval` | `false` removes the `eval_tab` tool. |
 
@@ -151,16 +160,15 @@ and rejects requests with an `Origin` header (browsers).
 ### Sessions and the engine
 
 Each MCP session gets its own engine process, so several agents can drive
-different apps at once. While an engine runs, macOS shows ChatGPT as sharing
-the screen of any app it captured, and a browser shows that ChatGPT is
-debugging it while the session has tabs attached.
+different apps at once. While a session has browser tabs attached, the browser
+shows that ChatGPT is debugging it.
 
 MCP clients usually keep their session open for as long as they run, so the
 bridge stops the engine on its own:
 
 - **`release`**: agents should call it when they finish with computer use, or
-  before waiting more than a few minutes. It detaches tabs (they stay open)
-  and stops the engine, which clears both indicators.
+  before waiting more than a few minutes. It detaches tabs (they stay open,
+  and the debugging banner goes away) and stops the engine.
 - **Idle stop**: after `engineIdleMinutes` without a call, the bridge does
   the same.
 
@@ -168,6 +176,57 @@ The session stays open either way, and the next call starts a new engine
 (about a second). Window and tab bindings are restored automatically, but
 element numbers from earlier trees are stale, so the first result after a
 restart says to call `get_state` again.
+
+### Screen indicators
+
+Keep ChatGPT.app quit on this Mac. The bridge only needs it installed: the
+engine starts ChatGPT's computer-use helper by itself.
+
+- **ChatGPT quit:** macOS shows its small purple screen-recording icon only
+  while the engine captures (each `get_state`, `screenshot` or action), and
+  nothing afterwards.
+- **ChatGPT running:** the helper runs under ChatGPT, and macOS shows a
+  "ChatGPT: Currently Sharing" item that lists every app it has captured. It
+  stays after the engine stops, `release` does not clear it, and it only goes
+  away with Stop Sharing or by quitting ChatGPT. Stop Sharing is safe whenever
+  no agent is in the middle of a task.
+
+The allowlist limits which apps agents can act on. It does not limit what the
+helper captures internally: with ChatGPT running, the sharing list showed other
+windows on screen too.
+
+### Remote machines over SSH
+
+A client that cannot connect to this Mac, such as an agent on a VM that you
+reach through Cloudflare WARP (traffic only flows from your Mac to the VM), can
+still use the bridge through a reverse SSH tunnel. The bridge keeps
+`ssh -R` open to the VM, so the server appears on the VM's own loopback:
+
+```bash
+computer-use-bridge setup   # choose "a remote machine over SSH", then give the host
+```
+
+- `setup` checks that this Mac can log in to the VM without prompts (the
+  service runs in the background), connecting interactively once if needed to
+  accept the host key. Use an SSH key; if it has a passphrase, store it in the
+  Keychain (`UseKeychain yes` and `AddKeysToAgent yes` in `~/.ssh/config`).
+- It offers to copy the token to `~/.config/computer-use-bridge/<mac>.token`
+  on the VM and prints the client configuration for
+  `http://127.0.0.1:<remotePort>/mcp`.
+- The server itself listens on `127.0.0.1` on the Mac. The tunnel opens the
+  port only on the VM's loopback. Other users of a shared VM can reach that
+  port but still need the token, so give each person their own port.
+- The service reconnects with backoff (2 s, doubling to 60 s) when the
+  network, the VM or the laptop's sleep drops the connection, and stops the
+  tunnels when it stops. `status` shows each tunnel as up or down with the
+  last error.
+- The tunnel uses its own SSH connection, never a shared `ControlMaster` one.
+- After an unclean disconnect, the VM's SSH server may keep the old port for
+  a minute; the tunnel retries until it is free. Do not kill the process
+  holding that port on the VM: with Tailscale SSH it is `tailscaled` itself.
+
+The Tailscale and SSH tunnel options are separate: without `tunnels` in the
+config, nothing about SSH runs.
 
 ## Using the fixed tools
 
@@ -213,7 +272,11 @@ How tabs are handled, and why:
 
 - `open_tab` opens the tab natively (Cmd+T in the front window) and then
   attaches to it, because tabs created through the browser API always land
-  in a "ChatGPT" tab group. The new tab becomes the active tab.
+  in a "ChatGPT" tab group. The new tab becomes the active tab. It refreshes
+  the window's state first, because the engine refuses input to a window that
+  changed since it last looked (e.g. after you used the browser).
+- If a tab's debugger detaches ("Debugger unattached"), the bridge re-attaches
+  and retries the call once. A batch is only retried if nothing in it ran yet.
 - A tab attached by one session is locked to it until that session's engine
   stops (`release`, idle stop, or the session closing). If the engine dies
   without that, its tabs can only be closed by hand.
@@ -231,7 +294,8 @@ window by title; use tabs for the browser and `rebind` for other apps.
 - `computer-use-bridge status` checks everything at once.
 - `tail -f /opt/homebrew/var/log/computer-use-bridge.log` shows sessions,
   approvals, engine starts and stops, and rejected requests.
-- `curl http://<address>:47800/healthz` checks the listener without a token.
+- `curl http://<address>:47800/healthz` checks the listener without a token;
+  with the token it also reports SSH tunnels.
 - The service retries until the listen address exists, e.g. until Tailscale
   is up after login.
 - `no unified-computer-use plugin`: open ChatGPT.app and set up Computer Use
