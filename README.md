@@ -134,8 +134,7 @@ the same time, your input and the agent's can interleave.
 - Clients can only act on allowed apps. They send parameters, not code; the
   one exception is `eval_tab`, whose expression runs in the page's read-only
   sandbox (`tabEval: false` removes it). Shells, script runners, password
-  managers, Keychain, System Settings, Mail
-  and Messages are always blocked.
+  managers, Keychain, System Settings, Mail and Messages are always blocked.
 - `stdio --raw` gives cua_repl's own `js` tool, which runs any JavaScript as
   you. It is only available over SSH, for clients that already have a shell
   on the Mac.
