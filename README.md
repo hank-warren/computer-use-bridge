@@ -131,8 +131,10 @@ the same time, your input and the agent's can interleave.
 
 - The HTTP server listens only on the address you chose, requires the token,
   and rejects requests from web browsers.
-- Clients can only act on allowed apps, and send parameters, not code.
-  Shells, script runners, password managers, Keychain, System Settings, Mail
+- Clients can only act on allowed apps. They send parameters, not code; the
+  one exception is `eval_tab`, whose expression runs in the page's read-only
+  sandbox (`tabEval: false` removes it). Shells, script runners, password
+  managers, Keychain, System Settings, Mail
   and Messages are always blocked.
 - `stdio --raw` gives cua_repl's own `js` tool, which runs any JavaScript as
   you. It is only available over SSH, for clients that already have a shell
@@ -148,7 +150,7 @@ run `brew services restart computer-use-bridge`.
 | `host`, `port` | Listen address. |
 | `allowApps` | Bundle IDs clients may control. Find one with `osascript -e 'id of app "Brave Browser"'`. |
 | `idleMinutes` | Close a client session after this long without a request (default 30). |
-| `maxSessions` | Most client sessions at once (default 4). |
+| `maxSessions` | Most client sessions at once; the least recently used is closed beyond this (default 4). |
 | `engineIdleMinutes` | Stop a session's engine after this long without a call (default 10; 0 never). |
 | `treeMaxChars` | Most characters of a tree per result (default 20000; 0 for no limit). |
 | `screenshotMaxWidth` | Screenshot width (default 1280; 0 keeps full size). |
