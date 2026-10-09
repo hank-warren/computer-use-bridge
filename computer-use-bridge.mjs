@@ -32,6 +32,8 @@ const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
 const DEFAULT_CONFIG = join(CONFIG_DIR, "config.json");
 const DEFAULT_PORT = 47800;
+// chatgpt: ChatGPT.app's cua_repl. open-computer-use: the open-source engine of that name.
+const ENGINES = ["chatgpt", "open-computer-use"];
 
 // Never controllable through the fixed surface, even if listed in allowApps:
 // shells, script runners, credential stores, system settings and mail/messages.
@@ -115,6 +117,9 @@ function loadConfig(opts) {
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
   cfg.engineIdleMinutes ??= 10;
+  cfg.engine ??= "chatgpt";
+  if (!ENGINES.includes(cfg.engine)) throw new Error(`engine must be one of ${ENGINES.join(", ")}`);
+  if (cfg.engine !== "chatgpt" && cfg.surface === "raw") throw new Error("--raw needs the chatgpt engine");
   if (typeof cfg.engineIdleMinutes !== "number" || !(cfg.engineIdleMinutes >= 0)) throw new Error("engineIdleMinutes must be a number >= 0 (0 disables)");
   return cfg;
 }
@@ -615,10 +620,14 @@ class Session {
     }
   }
 
+  newChild() {
+    return new CuaChild(this.cfg, this.label);
+  }
+
   async cua() {
     if (this.child && !this.child.dead) return this.child;
     this.starting ??= (async () => {
-      const c = new CuaChild(this.cfg, this.label);
+      const c = this.newChild();
       await c.start();
       this.child = c;
       this.appNames = null;
@@ -1054,6 +1063,317 @@ nodeRepl.write(__trunc(__r === undefined ? "undefined" : JSON.stringify(__r, nul
   }
 }
 
+// ---------- open-computer-use engine ----------
+
+// open-computer-use (github.com/iFurySt/open-codex-computer-use) serves Codex's nine
+// native computer-use tools over MCP stdio, with no OpenAI service or login.
+class OcuChild {
+  constructor(cfg, label) {
+    this.cfg = cfg;
+    this.label = label;
+    this.pending = new Map();
+    this.nextId = 1;
+    this.queue = Promise.resolve();
+    this.dead = false;
+  }
+
+  async start() {
+    const cmd = expand(this.cfg.ocuCommand ?? "open-computer-use");
+    // Its npm launcher runs on whatever `node` is on PATH; this process's node will do.
+    const env = { ...process.env, PATH: `${dirname(process.execPath)}:${process.env.PATH ?? "/usr/bin:/bin"}` };
+    env.OPEN_COMPUTER_USE_VISUAL_CURSOR = this.cfg.ocuVisualCursor === true ? "1" : "0";
+    this.proc = spawn(cmd, ["mcp"], { env, stdio: ["pipe", "pipe", "inherit"] });
+    const died = (why) => {
+      this.dead = true;
+      for (const { reject } of this.pending.values()) reject(new Error(why));
+      this.pending.clear();
+    };
+    this.proc.on("error", (e) => died(e.code === "ENOENT"
+      ? `${cmd} not found; install it with "npm i -g open-computer-use" or set ocuCommand in the config`
+      : `open-computer-use failed to start: ${e.message}`));
+    this.proc.on("exit", (code, sig) => died(`open-computer-use exited (${code ?? sig})`));
+    this.proc.stdin.on("error", () => {});
+    createInterface({ input: this.proc.stdout }).on("line", (line) => this.onLine(line));
+    const init = await this.request("initialize", {
+      protocolVersion: "2025-03-26", capabilities: {}, clientInfo: { name: NAME, version: VERSION },
+    }, 60_000);
+    this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+    log(`[${this.label}] open-computer-use ${init?.serverInfo?.version ?? ""} started`);
+  }
+
+  send(msg) {
+    if (!this.dead) this.proc.stdin.write(JSON.stringify(msg) + "\n");
+  }
+
+  onLine(line) {
+    let msg;
+    try { msg = JSON.parse(line); } catch { return; }
+    if (msg.method && msg.id !== undefined) {
+      if (msg.method === "ping") return this.send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      return this.send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `unsupported: ${msg.method}` } });
+    }
+    const p = this.pending.get(msg.id);
+    if (!p) return;
+    this.pending.delete(msg.id);
+    if (msg.error) p.reject(new Error(msg.error.message ?? "open-computer-use error"));
+    else p.resolve(msg.result);
+  }
+
+  request(method, params, timeoutMs = 60_000) {
+    if (this.dead) return Promise.reject(new Error("open-computer-use is not running"));
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`open-computer-use ${method} timed out`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this.send({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+
+  // One call at a time: element numbers refer to the engine's latest snapshot.
+  call(name, args, timeoutMs) {
+    const run = () => this.request("tools/call", { name, arguments: args }, timeoutMs);
+    const p = this.queue.then(run, run);
+    this.queue = p.catch(() => {});
+    return p;
+  }
+
+  async close() {
+    if (this.dead) return;
+    this.dead = true;
+    this.proc.kill("SIGTERM");
+  }
+}
+
+const OCU_ACTIONS = ["click", "type_text", "press_key", "set_value", "scroll", "drag", "secondary_action"];
+const OCU_TOOLS = new Set(["list_apps", "release", "launch_app", "get_state", "screenshot", "batch", ...OCU_ACTIONS]);
+
+// The fixed tools open-computer-use can serve: no browser tabs, paste or select_text,
+// whole trees instead of diffs, and scrolling by element only.
+function ocuToolDefs() {
+  const scrollProps = { element: elementProp, direction: ACTIONS.scroll.props.direction, pages: ACTIONS.scroll.props.pages };
+  const itemProps = Object.assign({}, ...OCU_ACTIONS.map((n) => (n === "scroll" ? scrollProps : ACTIONS[n].props)), {
+    action: { type: "string", enum: [...OCU_ACTIONS, "wait"] },
+    name: batchItemProps.name,
+    ms: batchItemProps.ms,
+  });
+  return TOOL_DEFS.filter((d) => OCU_TOOLS.has(d.name)).map((d) => {
+    const props = { ...d.props };
+    delete props.tab;
+    let { description, required } = d;
+    description = description.replace("Returns a diff of the tree.", "Returns the window's tree.");
+    if (d.name === "scroll") {
+      delete props.x;
+      delete props.y;
+      required = ["element", "direction"];
+      description = "Scroll an element by pages. Returns the window's tree.";
+    } else if (d.name === "get_state") {
+      delete props.full;
+      delete props.rebind;
+      description = "Return the accessibility tree of an app's key window, with numbered elements. Element numbers are valid until the next call.";
+    } else if (d.name === "screenshot") {
+      description = "Screenshot of the app's key window.";
+    } else if (d.name === "release") {
+      description = "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Stops the engine; the next call restarts it.";
+    } else if (d.name === "batch") {
+      props.actions = { ...props.actions, items: { ...props.actions.items, properties: itemProps } };
+      description = "Run up to 25 actions in order in one call (click, type_text, press_key, set_value, scroll, drag, secondary_action, or wait with ms), then return the tree once. Stops at the first failing step. Element numbers are from the tree before the batch, so prefer coordinates or stable elements for later steps.";
+    }
+    return { ...d, props, description, required };
+  });
+}
+
+// Same tools, allowlist and result limits as Session, run on open-computer-use.
+class OcuSession extends Session {
+  constructor(cfg, label) {
+    super(cfg, label);
+    this.tools = ocuToolDefs().map(toolSchema);
+  }
+
+  newChild() {
+    return new OcuChild(this.cfg, this.label);
+  }
+
+  instructions() {
+    return `Computer use on the Mac "${hostname()}" through open-computer-use (open source; no OpenAI service). Allowed apps: ${this.cfg.allowApps.join(", ") || "(none)"}. ` +
+      "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
+      "There are no browser-tab tools: drive a browser through its window (press_key super+t, super+l, type_text, Return). " +
+      "Use batch to run several actions in one call. Screenshots come only from screenshot or get_state with screenshot: true; coordinates you give refer to the image you received. " +
+      "Call release when you finish with computer use. Input goes to the target without moving the user's cursor, but the user may be using the same window. " +
+      "Ask the user before sending messages, submitting forms, purchasing, or transmitting sensitive data.";
+  }
+
+  // [{ id, displayName, isRunning }] from lines like "Discord — com.hnc.Discord [running, ...]".
+  async apps() {
+    if (this.appNames && this.child) return this.appNames;
+    const r = await (await this.cua()).call("list_apps", {});
+    const text = (r.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
+    this.appNames = text.split("\n").map((l) => /^(.*) — (\S+) \[(.*)\]$/.exec(l.trim())).filter(Boolean)
+      .map(([, displayName, id, flags]) => ({ id, displayName, isRunning: /\brunning\b/.test(flags) }));
+    return this.appNames;
+  }
+
+  async resolveApp(app) {
+    str(app, "app", 200);
+    if (this.cfg.isAllowed(app)) return app;
+    const id = (await this.apps()).find((x) => x.displayName.toLowerCase() === app.toLowerCase())?.id ?? app;
+    if (this.cfg.isAllowed(id)) return id;
+    throw new BadInput(`app not allowed: ${app}${id !== app ? ` (${id})` : ""}. Allowed: ${this.cfg.allowApps.join(", ")}`);
+  }
+
+  callFixed(name, a) {
+    return this.callFixedOnce(name, a);
+  }
+
+  // The engine's tool name and arguments for one action; coordinates are mapped from the
+  // client's downscaled screenshot back to the engine's.
+  ocuAction(name, a, id) {
+    const scale = this.scales.get(`app:${id}`) ?? 1;
+    const xy = (x, y, nx, ny) => ({ [nx]: Math.round(num(x, nx) * scale), [ny]: Math.round(num(y, ny) * scale) });
+    const el = (v) => String(int(v, "element"));
+    switch (name) {
+      case "click": {
+        const args = { app: id };
+        if (a.element !== undefined) args.element_index = el(a.element);
+        else if (a.x !== undefined || a.y !== undefined) Object.assign(args, xy(a.x, a.y, "x", "y"));
+        else throw new BadInput("give element, or x and y");
+        if (a.button !== undefined) {
+          if (!["left", "right", "middle"].includes(a.button)) throw new BadInput("button must be left, right or middle");
+          args.mouse_button = a.button;
+        }
+        if (a.count !== undefined) args.click_count = int(a.count, "count");
+        return ["click", args];
+      }
+      case "type_text": return ["type_text", { app: id, text: str(a.text, "text") }];
+      case "press_key":
+        if (!/^[A-Za-z0-9_+\-]{1,40}$/.test(a.key ?? "")) throw new BadInput("key must look like Return, super+t or KP_0");
+        return ["press_key", { app: id, key: a.key }];
+      case "set_value": return ["set_value", { app: id, element_index: el(a.element), value: str(a.value, "value") }];
+      case "scroll": {
+        if (a.element === undefined) throw new BadInput("this engine scrolls elements only; give element");
+        if (!["up", "down", "left", "right"].includes(a.direction)) throw new BadInput("direction must be up, down, left or right");
+        return ["scroll", { app: id, element_index: el(a.element), direction: a.direction, pages: a.pages === undefined ? 1 : num(a.pages, "pages") }];
+      }
+      case "drag": return ["drag", { app: id, ...xy(a.from_x, a.from_y, "from_x", "from_y"), ...xy(a.to_x, a.to_y, "to_x", "to_y") }];
+      case "secondary_action": return ["perform_secondary_action", { app: id, element_index: el(a.element), action: str(a.action, "action", 100) }];
+      default: throw new BadInput(`unknown action ${name}`);
+    }
+  }
+
+  // Caps the tree (keeping the trailing focus and selection lines) and drops the screenshot
+  // the engine attaches to every result, unless one was asked for.
+  async shape(res, id, { cap, maxWidth, image = false, tree = true }) {
+    const content = [];
+    for (const c of res.content ?? []) {
+      if (c.type === "image") {
+        if (!image) continue;
+        const scaled = await scaleImage(c, maxWidth);
+        content.push(scaled.block);
+        this.scales.set(`app:${id}`, scaled.scale);
+        if (scaled.scale !== 1) content.push({ type: "text", text: `Screenshot scaled from ${scaled.width} to ${maxWidth} px wide; give coordinates from this image.` });
+        continue;
+      }
+      if (c.type !== "text") {
+        content.push(c);
+        continue;
+      }
+      if (!tree && !res.isError) continue;
+      let text = c.text;
+      if (cap && text.length > cap) {
+        const lines = text.split("\n");
+        let k = lines.length;
+        while (k > 0 && /^(The focused UI element|Selected text)/.test(lines[k - 1])) k--;
+        const body = lines.slice(0, k).join("\n");
+        const tail = lines.slice(k).join("\n");
+        if (body.length > cap) {
+          let cut = body.lastIndexOf("\n", cap);
+          if (cut < cap * 0.8) cut = /[\uD800-\uDBFF]/.test(body[cap - 1]) ? cap - 1 : cap;
+          text = `${body.slice(0, cut)}\n[Tree truncated: showing ${cut} of ${body.length} characters. Elements after this point exist but are not listed. To see them, call get_state with a larger max_chars (0 for no limit).]${tail ? `\n${tail}` : ""}`;
+        }
+      }
+      content.push({ ...c, text });
+    }
+    return { content: content.length ? content : [{ type: "text", text: "ok" }], isError: !!res.isError };
+  }
+
+  async callFixedOnce(name, a) {
+    if (!this.tools.some((t) => t.name === name)) throw new BadInput(`unknown tool ${name}`);
+    if (a.tab !== undefined) throw new BadInput("this server runs open-computer-use, which has no browser-tab tools; give app");
+    const maxWidth = this.maxWidth(a);
+    const cap = this.treeCap(name, a);
+    const ocu = async (tool, args, timeoutMs = 60_000) => (await this.cua()).call(tool, args, timeoutMs);
+    switch (name) {
+      case "release":
+        return textResult(await this.stopEngine("released")
+          ? "Released: the engine stopped. The next call restarts it."
+          : "Nothing to release; the engine is not running.");
+      case "list_apps": {
+        const ids = this.cfg.approve === "all" ? null : this.cfg.allowApps.map((x) => x.toLowerCase());
+        const apps = (await this.apps()).filter((x) => !ids || ids.includes(x.id.toLowerCase()));
+        return textResult(JSON.stringify(apps, null, 1));
+      }
+      case "launch_app": return super.callFixedOnce(name, a);
+      case "get_state": {
+        const id = await this.resolveApp(a.app);
+        const r = await ocu("get_app_state", { app: id, ...(cap === 0 ? { max_tree_nodes: 100_000 } : {}) });
+        return this.shape(r, id, { cap, maxWidth, image: a.screenshot === true });
+      }
+      case "screenshot": {
+        const id = await this.resolveApp(a.app);
+        const r = await ocu("get_app_state", { app: id, max_tree_nodes: 1 });
+        return this.shape(r, id, { cap, maxWidth, image: true, tree: false });
+      }
+      case "batch": {
+        const id = await this.resolveApp(a.app);
+        if (!Array.isArray(a.actions) || a.actions.length < 1 || a.actions.length > 25) throw new BadInput("actions must hold 1 to 25 steps");
+        // Every step is checked before any runs.
+        const steps = a.actions.map((s, i) => {
+          if (typeof s !== "object" || s === null) throw new BadInput(`step ${i + 1} must be an object`);
+          const { action, name: actionName, ...rest } = s;
+          try {
+            if (action === "wait") {
+              const ms = int(rest.ms ?? 500, "ms");
+              if (ms > 10_000) throw new BadInput("ms must be at most 10000");
+              return { action, ms };
+            }
+            if (!OCU_ACTIONS.includes(action)) throw new BadInput(`unknown action ${action}`);
+            return { action, call: this.ocuAction(action, action === "secondary_action" ? { ...rest, action: actionName } : rest, id) };
+          } catch (e) {
+            throw e instanceof BadInput ? new BadInput(`step ${i + 1} (${action}): ${e.message}`) : e;
+          }
+        });
+        let last = null;
+        for (const [i, s] of steps.entries()) {
+          if (s.action === "wait") {
+            await new Promise((r) => setTimeout(r, s.ms));
+            last = null;
+            continue;
+          }
+          last = await ocu(...s.call);
+          if (last.isError) {
+            const out = await this.shape(last, id, { cap, maxWidth });
+            out.content.unshift({ type: "text", text: `Batch stopped at step ${i + 1} (${s.action}).` });
+            return out;
+          }
+        }
+        if (!last || a.screenshot === true) last = await ocu("get_app_state", { app: id });
+        return this.shape(last, id, { cap, maxWidth, image: a.screenshot === true });
+      }
+      default: {
+        const id = await this.resolveApp(a.app);
+        return this.shape(await ocu(...this.ocuAction(name, a, id)), id, { cap, maxWidth });
+      }
+    }
+  }
+}
+
+const newSession = (cfg, label) => (cfg.engine === "open-computer-use" ? new OcuSession(cfg, label) : new Session(cfg, label));
+
 // ---------- MCP server side ----------
 
 async function handle(session, msg) {
@@ -1084,7 +1404,7 @@ async function handle(session, msg) {
 }
 
 function runStdio(cfg) {
-  const session = new Session(cfg, "stdio");
+  const session = newSession(cfg, "stdio");
   const out = (m) => process.stdout.write(JSON.stringify(m) + "\n");
   const rl = createInterface({ input: process.stdin });
   rl.on("line", async (line) => {
@@ -1229,7 +1549,7 @@ function runHttp(cfg) {
         closeSession(oldest, "evicted");
       }
       const newId = randomUUID();
-      session = new Session(cfg, newId.slice(0, 8));
+      session = newSession(cfg, newId.slice(0, 8));
       sessions.set(newId, session);
       headers = { "Mcp-Session-Id": newId };
       log(`[${session.label}] opened from ${req.socket.remoteAddress}`);
@@ -1245,7 +1565,7 @@ function runHttp(cfg) {
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
   const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
   server.listen(cfg.port, cfg.host, () => {
-    log(`serving fixed surface on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ")}`);
+    log(`serving fixed surface (${cfg.engine} engine) on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ")}`);
     for (const t of tunnels) t.start();
   });
   const stop = async () => {
