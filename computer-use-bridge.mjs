@@ -20,7 +20,8 @@ import { randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto
 import { chmodSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
-import { homedir, hostname, networkInterfaces, tmpdir } from "node:os";
+import { createConnection } from "node:net";
+import { endianness, homedir, hostname, networkInterfaces, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
@@ -615,13 +616,17 @@ class Session {
     const idleMs = cfg.engineIdleMinutes * 60_000;
     if (cfg.surface === "fixed" && idleMs > 0) {
       this.reaper = setInterval(() => {
-        if (this.child && !this.busy && Date.now() - this.lastUsed >= idleMs) this.stopEngine("idle");
+        if (this.engineRunning() && !this.busy && Date.now() - this.lastUsed >= idleMs) this.stopEngine("idle");
       }, Math.min(30_000, idleMs)).unref();
     }
   }
 
   newChild() {
     return new CuaChild(this.cfg, this.label);
+  }
+
+  engineRunning() {
+    return !!this.child;
   }
 
   async cua() {
@@ -1150,39 +1155,477 @@ class OcuChild {
   }
 }
 
+// ---------- open-browser-use: browser tabs for the open-computer-use engine ----------
+
+// open-browser-use (github.com/iFurySt/open-browser-use) is a browser extension plus a native
+// host that relays CDP for the tabs of a session. Agent tabs open in the background in the session's
+// tab group of the focused window; the user's own tabs are never claimed.
+const OBU_SESSION = "computer-use-bridge";
+const OBU_REGISTRY = "/tmp/open-browser-use/active.json";
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// xdotool key name -> [key, code, keyCode, text]
+const CDP_KEYS = {
+  Return: ["Enter", "Enter", 13, "\r"], KP_Enter: ["Enter", "NumpadEnter", 13, "\r"], Tab: ["Tab", "Tab", 9],
+  Escape: ["Escape", "Escape", 27], BackSpace: ["Backspace", "Backspace", 8], Delete: ["Delete", "Delete", 46],
+  space: [" ", "Space", 32, " "], Up: ["ArrowUp", "ArrowUp", 38], Down: ["ArrowDown", "ArrowDown", 40],
+  Left: ["ArrowLeft", "ArrowLeft", 37], Right: ["ArrowRight", "ArrowRight", 39], Home: ["Home", "Home", 36],
+  End: ["End", "End", 35], Page_Up: ["PageUp", "PageUp", 33], Page_Down: ["PageDown", "PageDown", 34],
+  Insert: ["Insert", "Insert", 45],
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, [`F${i + 1}`, `F${i + 1}`, 112 + i]])),
+};
+const CDP_MODIFIERS = { alt: 1, option: 1, ctrl: 2, control: 2, super: 4, cmd: 4, meta: 4, shift: 8 };
+// Editing shortcuts need an explicit command when sent through CDP on macOS.
+const CDP_COMMANDS = { a: "selectAll", c: "copy", v: "paste", x: "cut", z: "undo" };
+
+function cdpKey(spec) {
+  const parts = spec.split("+");
+  const name = parts.pop();
+  let modifiers = 0;
+  for (const m of parts) {
+    const bit = CDP_MODIFIERS[m.toLowerCase()];
+    if (!bit) throw new BadInput(`unknown modifier ${m}`);
+    modifiers |= bit;
+  }
+  let key, code, keyCode, text;
+  if (CDP_KEYS[name]) [key, code, keyCode, text] = CDP_KEYS[name];
+  else if (name.length === 1) {
+    const upper = name.toUpperCase();
+    key = modifiers & 8 && /[a-z]/.test(name) ? upper : name;
+    code = /[a-z]/i.test(name) ? `Key${upper}` : /\d/.test(name) ? `Digit${name}` : "";
+    keyCode = upper.charCodeAt(0);
+    text = key;
+  } else throw new BadInput(`unknown key ${name}`);
+  if (modifiers & (1 | 2 | 4)) text = undefined;
+  const command = modifiers === 4 && CDP_COMMANDS[name.toLowerCase()];
+  const redo = modifiers === (4 | 8) && name.toLowerCase() === "z";
+  return { key, code, windowsVirtualKeyCode: keyCode, modifiers, text, commands: redo ? ["redo"] : command ? [command] : undefined };
+}
+
+// Finds elements for tab_locator kinds other than role; runs in the page.
+const FIND_ELEMENTS = `(spec) => {
+  const norm = (s) => (s ?? "").replace(/\\s+/g, " ").trim();
+  const hit = (s) => spec.exact ? norm(s) === spec.q : norm(s).toLowerCase().includes(spec.q.toLowerCase());
+  let out = [];
+  if (spec.kind === "css") out = [...document.querySelectorAll(spec.q)];
+  else if (spec.kind === "test_id") out = [...document.querySelectorAll('[data-testid="' + CSS.escape(spec.q) + '"]')];
+  else {
+    const all = [...document.querySelectorAll("body *")].filter((e) => !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(e.tagName));
+    if (spec.kind === "placeholder") out = all.filter((e) => e.hasAttribute("placeholder") && hit(e.getAttribute("placeholder")));
+    else if (spec.kind === "label") {
+      for (const l of document.querySelectorAll("label")) if (l.control && hit(l.innerText)) out.push(l.control);
+      for (const e of all) if (e.hasAttribute("aria-label") && hit(e.getAttribute("aria-label"))) out.push(e);
+    } else if (spec.kind === "text") {
+      const t = (e) => e.innerText ?? e.textContent;
+      out = all.filter((e) => hit(t(e)) && ![...e.children].some((c) => hit(t(c))));
+    }
+  }
+  return [...new Set(out)].slice(0, 50);
+}`;
+
+// Playwright key names (Enter, Control+A) as xdotool names (Return, ctrl+a).
+function pwKey(k) {
+  const names = { Enter: "Return", Backspace: "BackSpace", ArrowUp: "Up", ArrowDown: "Down", ArrowLeft: "Left", ArrowRight: "Right", PageUp: "Page_Up", PageDown: "Page_Down", Space: "space", " ": "space", Control: "ctrl", Meta: "super", Alt: "alt", Shift: "shift" };
+  return k.split(/\+(?!$)/).map((p) => names[p] ?? p).join("+");
+}
+
+class ObuBrowser {
+  constructor(cfg, label) {
+    this.cfg = cfg;
+    this.label = label;
+    this.sock = null;
+    this.buf = Buffer.alloc(0);
+    this.next = 1;
+    this.pending = new Map();
+    this.attached = new Set();
+    this.elements = new Map(); // tab -> Map(element number -> backendDOMNodeId)
+    this.scales = new Map(); // tab -> CSS px per screenshot px
+  }
+
+  async connect() {
+    if (this.sock) return;
+    const file = expand(this.cfg.obuRegistry ?? OBU_REGISTRY);
+    let reg;
+    try { reg = JSON.parse(readFileSync(file, "utf8")); } catch {
+      throw new Error(`open-browser-use is not connected (no ${file}); install it, add its extension to the browser, and restart the browser`);
+    }
+    const sock = createConnection(reg.socketPath);
+    await new Promise((resolve, reject) => {
+      sock.once("connect", resolve);
+      sock.once("error", (e) => reject(new Error(`cannot reach open-browser-use (${e.message}); is the browser running with its extension connected?`)));
+    });
+    sock.on("error", () => {});
+    sock.on("data", (d) => this.onData(d));
+    sock.on("close", () => {
+      for (const p of this.pending.values()) p.reject(new Error("open-browser-use connection closed"));
+      this.pending.clear();
+      this.attached.clear();
+      if (this.sock === sock) this.sock = null;
+    });
+    this.sock = sock;
+    log(`[${this.label}] open-browser-use connected`);
+  }
+
+  // Frames are a 4-byte native-endian length and a JSON message.
+  onData(d) {
+    this.buf = Buffer.concat([this.buf, d]);
+    const read = endianness() === "LE" ? "readUInt32LE" : "readUInt32BE";
+    while (this.buf.length >= 4) {
+      const n = this.buf[read](0);
+      if (this.buf.length < 4 + n) break;
+      let msg;
+      try { msg = JSON.parse(this.buf.subarray(4, 4 + n).toString("utf8")); } catch { msg = null; }
+      this.buf = this.buf.subarray(4 + n);
+      const p = msg?.id !== undefined && this.pending.get(String(msg.id));
+      if (!p) continue;
+      this.pending.delete(String(msg.id));
+      if (msg.error) p.reject(new Error(msg.error.message ?? "open-browser-use error"));
+      else p.resolve(msg.result);
+    }
+  }
+
+  async request(method, params = {}, timeoutMs = 20_000) {
+    await this.connect();
+    const id = String(this.next++);
+    const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, method, params: { session_id: OBU_SESSION, turn_id: OBU_SESSION, ...params } }));
+    const head = Buffer.alloc(4);
+    head[endianness() === "LE" ? "writeUInt32LE" : "writeUInt32BE"](body.length, 0);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`open-browser-use ${method} timed out`));
+      }, timeoutMs);
+      this.pending.set(id, {
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+      this.sock.write(Buffer.concat([head, body]));
+    });
+  }
+
+  async attach(tab) {
+    if (this.attached.has(tab)) return;
+    await this.request("attach", { tabId: tab });
+    this.attached.add(tab);
+    // Background tabs are unfocused; without this, focus-dependent pages and input misbehave.
+    await this.request("executeCdp", { target: { tabId: tab }, method: "Emulation.setFocusEmulationEnabled", commandParams: { enabled: true } }).catch(() => {});
+  }
+
+  async cdp(tab, method, params = {}, timeoutMs = 20_000) {
+    const send = async () => {
+      await this.attach(tab);
+      return this.request("executeCdp", { target: { tabId: tab }, method, commandParams: params, timeoutMs }, timeoutMs + 5000);
+    };
+    try { return await send(); } catch (e) {
+      if (!/Debugger (unattached|detached|is not attached)/i.test(e.message)) throw e;
+      this.attached.delete(tab);
+      return send();
+    }
+  }
+
+  async eval(tab, expression, opts = {}) {
+    const r = await this.cdp(tab, "Runtime.evaluate", { expression, returnByValue: true, ...opts });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "evaluation failed");
+    return r.result?.value;
+  }
+
+  async agentTabs() {
+    return (await this.request("getTabs")).filter((t) => Number.isInteger(t.id));
+  }
+
+  async userTabs() {
+    return this.request("getUserTabs");
+  }
+
+  async requireAgentTab(tab) {
+    const id = Number(tab);
+    if (!Number.isInteger(id) || id <= 0) throw new BadInput("tab must be a tab ID from list_tabs or open_tab");
+    if (!(await this.agentTabs()).some((t) => t.id === id)) {
+      throw new BadInput(`tab ${tab} is not an agent tab. Agents work only in tabs they opened with open_tab, so the user's own tabs are never touched; open the page with open_tab.`);
+    }
+    return id;
+  }
+
+  // The extension's default: a background tab in the focused window, in the session's tab group.
+  async openTab(url) {
+    const tab = (await this.request("createTab")).id;
+    await this.cdp(tab, "Page.navigate", { url });
+    await this.waitLoad(tab, true);
+    return tab;
+  }
+
+  async waitLoad(tab, leaveBlank = false) {
+    const until = Date.now() + 15_000;
+    for (;;) {
+      const s = await this.eval(tab, "location.href + ' ' + document.readyState").catch(() => "");
+      const [href, state] = s.split(" ");
+      const moved = !leaveBlank || (href && href !== "about:blank");
+      if (moved && state === "complete") return;
+      if (Date.now() > until) return;
+      await sleep(150);
+    }
+  }
+
+  // The tab's accessibility tree, numbered; the numbers map to DOM nodes until the next tree.
+  async tree(tab) {
+    const { nodes } = await this.cdp(tab, "Accessibility.getFullAXTree", {}, 30_000);
+    const byId = new Map(nodes.map((n) => [n.nodeId, n]));
+    const root = nodes.find((n) => !n.parentId) ?? nodes[0];
+    const prop = (n, name) => n.properties?.find((p) => p.name === name)?.value?.value;
+    const clip = (s, max) => (s.length > max ? `${s.slice(0, max)}…` : s);
+    const lines = [];
+    const map = new Map();
+    let next = 0;
+    const visit = (node, depth, parentName) => {
+      const kids = (node.childIds ?? []).map((i) => byId.get(i)).filter(Boolean);
+      const role = node.role?.value ?? "";
+      const name = (node.name?.value ?? "").replace(/\s+/g, " ").trim();
+      if (role === "InlineTextBox" || (role === "StaticText" && (!name || name === parentName))) return;
+      if (node.ignored || (["generic", "none", "GenericContainer", "LineBreak"].includes(role) && !name)) {
+        for (const k of kids) visit(k, depth, parentName);
+        return;
+      }
+      const num = next++;
+      if (node.backendDOMNodeId) map.set(num, node.backendDOMNodeId);
+      const flags = ["focused", "disabled", "required"].filter((f) => prop(node, f) === true);
+      const checked = prop(node, "checked");
+      if (checked === true || checked === "true") flags.push("checked");
+      else if (checked === "mixed") flags.push("mixed");
+      const expanded = prop(node, "expanded");
+      if (expanded === true) flags.push("expanded");
+      else if (expanded === false) flags.push("collapsed");
+      if (prop(node, "selected") === true) flags.push("selected");
+      const label = role === "StaticText" ? "text" : role === "RootWebArea" ? "web area" : role;
+      let line = `${"\t".repeat(depth)}${num} ${label}${flags.length ? ` (${flags.join(", ")})` : ""}${name ? ` ${clip(name, 300)}` : ""}`;
+      const value = node.value?.value;
+      if (value !== undefined && value !== "" && String(value) !== name) line += `, Value: ${clip(String(value), 300)}`;
+      const url = role === "link" || role === "RootWebArea" ? prop(node, "url") : undefined;
+      if (url) line += `, URL: ${url}`;
+      lines.push(line);
+      for (const k of kids) visit(k, depth + 1, name || parentName);
+    };
+    visit(root, 0, "");
+    this.elements.set(tab, map);
+    return `Browser tab: ${tab}\n${lines.join("\n")}`;
+  }
+
+  node(tab, element) {
+    const id = this.elements.get(tab)?.get(int(element, "element"));
+    if (!id) throw new BadInput(`element ${element} is not in tab ${tab}'s latest tree; call get_state`);
+    return id;
+  }
+
+  async objectFor(tab, backendNodeId) {
+    return (await this.cdp(tab, "DOM.resolveNode", { backendNodeId })).object.objectId;
+  }
+
+  async call(tab, backendNodeId, fn, args = []) {
+    const objectId = await this.objectFor(tab, backendNodeId);
+    const r = await this.cdp(tab, "Runtime.callFunctionOn", { objectId, functionDeclaration: fn, arguments: args.map((value) => ({ value })), returnByValue: true, userGesture: true });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+    return r.result?.value;
+  }
+
+  // Viewport point (CSS px) at the middle of a node, scrolling it into view first.
+  async center(tab, backendNodeId) {
+    await this.cdp(tab, "DOM.scrollIntoViewIfNeeded", { backendNodeId }).catch(() => {});
+    try {
+      const q = (await this.cdp(tab, "DOM.getBoxModel", { backendNodeId })).model.border;
+      return { x: (q[0] + q[4]) / 2, y: (q[1] + q[5]) / 2 };
+    } catch { return null; }
+  }
+
+  // Coordinates from the client's (downscaled) screenshot, in CSS px.
+  point(tab, x, y) {
+    const s = this.scales.get(tab) ?? 1;
+    return { x: num(x, "x") * s, y: num(y, "y") * s };
+  }
+
+  async target(tab, a) {
+    if (a.element !== undefined) {
+      const id = this.node(tab, a.element);
+      return { id, at: await this.center(tab, id) };
+    }
+    if (a.x !== undefined || a.y !== undefined) return { at: this.point(tab, a.x, a.y) };
+    return null;
+  }
+
+  async mouse(tab, type, at, extra = {}) {
+    await this.cdp(tab, "Input.dispatchMouseEvent", { type, x: at.x, y: at.y, ...extra });
+  }
+
+  async click(tab, a) {
+    const t = await this.target(tab, a);
+    if (!t) throw new BadInput("give element, or x and y");
+    const button = a.button ?? "left";
+    if (!["left", "right", "middle"].includes(button)) throw new BadInput("button must be left, right or middle");
+    const count = a.count === undefined ? 1 : int(a.count, "count");
+    if (!t.at) return this.call(tab, t.id, "function () { this.click(); }");
+    await this.mouse(tab, "mouseMoved", t.at);
+    for (let i = 1; i <= count; i++) {
+      await this.mouse(tab, "mousePressed", t.at, { button, buttons: { left: 1, right: 2, middle: 4 }[button], clickCount: i });
+      await this.mouse(tab, "mouseReleased", t.at, { button, buttons: 0, clickCount: i });
+    }
+  }
+
+  async key(tab, spec) {
+    const k = cdpKey(spec);
+    await this.cdp(tab, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", ...k });
+    await this.cdp(tab, "Input.dispatchKeyEvent", { type: "keyUp", key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode, modifiers: k.modifiers });
+  }
+
+  async setValue(tab, backendNodeId, value) {
+    await this.call(tab, backendNodeId, `function (v) {
+  this.focus();
+  if (this.isContentEditable) this.textContent = v;
+  else {
+    const d = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), "value");
+    d && d.set ? d.set.call(this, v) : (this.value = v);
+  }
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+}`, [value]);
+  }
+
+  // Scrolls in page JS: wheel events wait on frames that a background tab does not draw.
+  async scroll(tab, a) {
+    if (!["up", "down", "left", "right"].includes(a.direction)) throw new BadInput("direction must be up, down, left or right");
+    const pages = a.pages === undefined ? 1 : num(a.pages, "pages");
+    const dy = { up: -1, down: 1 }[a.direction] ?? 0;
+    const dx = { left: -1, right: 1 }[a.direction] ?? 0;
+    const fn = `function (dx, dy) {
+  const can = (e) => e && (dy ? e.scrollHeight > e.clientHeight : e.scrollWidth > e.clientWidth) && /auto|scroll|overlay/.test(getComputedStyle(e)[dy ? "overflowY" : "overflowX"]);
+  let e = this === window || this === undefined ? null : this;
+  while (e && e !== document.body && e !== document.documentElement && !can(e)) e = e.parentElement;
+  const target = e && can(e) ? e : document.scrollingElement;
+  const box = target === document.scrollingElement ? { w: innerWidth, h: innerHeight } : { w: target.clientWidth, h: target.clientHeight };
+  target.scrollBy(dx * box.w * 0.8, dy * box.h * 0.8);
+}`;
+    let objectId;
+    if (a.element !== undefined) objectId = await this.objectFor(tab, this.node(tab, a.element));
+    else if (a.x !== undefined || a.y !== undefined) {
+      const p = this.point(tab, a.x, a.y);
+      const r = await this.cdp(tab, "Runtime.evaluate", { expression: `document.elementFromPoint(${p.x}, ${p.y})` });
+      objectId = r.result?.objectId;
+    }
+    if (!objectId) objectId = (await this.cdp(tab, "Runtime.evaluate", { expression: "document.documentElement" })).result.objectId;
+    const r = await this.cdp(tab, "Runtime.callFunctionOn", { objectId, functionDeclaration: fn, arguments: [{ value: dx * pages }, { value: dy * pages }] });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description ?? r.exceptionDetails.text);
+  }
+
+  async drag(tab, a) {
+    const from = this.point(tab, a.from_x, a.from_y);
+    const to = this.point(tab, a.to_x, a.to_y);
+    await this.mouse(tab, "mouseMoved", from);
+    await this.mouse(tab, "mousePressed", from, { button: "left", buttons: 1, clickCount: 1 });
+    for (let i = 1; i <= 5; i++) {
+      await this.mouse(tab, "mouseMoved", { x: from.x + ((to.x - from.x) * i) / 5, y: from.y + ((to.y - from.y) * i) / 5 }, { button: "left", buttons: 1 });
+    }
+    await this.mouse(tab, "mouseReleased", to, { button: "left", buttons: 0, clickCount: 1 });
+  }
+
+  async screenshot(tab, maxWidth) {
+    const vp = (await this.cdp(tab, "Page.getLayoutMetrics")).cssLayoutViewport;
+    const shot = await this.cdp(tab, "Page.captureScreenshot", { format: "jpeg", quality: 75 });
+    const block = { type: "image", mimeType: "image/jpeg", data: shot.data };
+    const scaled = await scaleImage(block, maxWidth);
+    const sent = scaled.scale !== 1 ? maxWidth : imageWidth(Buffer.from(shot.data, "base64"));
+    if (sent) this.scales.set(tab, vp.clientWidth / sent);
+    return scaled;
+  }
+
+  // Elements matched by a tab_locator spec, as backend node IDs.
+  async locate(tab, a) {
+    const kinds = ["css", "role", "text", "label", "placeholder", "test_id"].filter((k) => a[k] !== undefined);
+    if (kinds.length !== 1) throw new BadInput("give exactly one of css, role, text, label, placeholder or test_id");
+    const kind = kinds[0];
+    const q = str(a[kind], kind, 2000);
+    if (kind === "role") {
+      const doc = (await this.cdp(tab, "DOM.getDocument", { depth: 0 })).root.backendNodeId;
+      const name = a.name === undefined ? undefined : str(a.name, "name", 2000);
+      const r = await this.cdp(tab, "Accessibility.queryAXTree", { backendNodeId: doc, role: q, ...(name !== undefined && a.exact === true ? { accessibleName: name } : {}) });
+      const want = (n) => name === undefined || a.exact === true || (n.name?.value ?? "").toLowerCase().includes(name.toLowerCase());
+      return r.nodes.filter((n) => !n.ignored && n.backendDOMNodeId && want(n)).map((n) => n.backendDOMNodeId);
+    }
+    const r = await this.cdp(tab, "Runtime.evaluate", { expression: `(${FIND_ELEMENTS})(${J({ kind, q, exact: a.exact === true })})` });
+    if (r.exceptionDetails) throw new BadInput(`locator failed: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
+    const props = await this.cdp(tab, "Runtime.getProperties", { objectId: r.result.objectId, ownProperties: true });
+    const ids = [];
+    for (const p of props.result.filter((p) => /^\d+$/.test(p.name)).sort((x, y) => x.name - y.name)) {
+      if (p.value?.objectId) ids.push((await this.cdp(tab, "DOM.describeNode", { objectId: p.value.objectId })).node.backendNodeId);
+    }
+    return ids;
+  }
+
+  async detachAll() {
+    for (const tab of [...this.attached]) await this.request("detach", { tabId: tab }, 5000).catch(() => {});
+    this.attached.clear();
+  }
+
+  async close() {
+    if (!this.sock) return;
+    await this.detachAll().catch(() => {});
+    this.sock?.end();
+    this.sock = null;
+  }
+}
+
 const OCU_ACTIONS = ["click", "type_text", "press_key", "set_value", "scroll", "drag", "secondary_action"];
+const OBU_TOOLS = ["list_tabs", "open_tab", "navigate_tab", "close_tab", "read_tab", "eval_tab", "tab_locator"];
 const OCU_TOOLS = new Set(["list_apps", "release", "launch_app", "get_state", "screenshot", "batch", ...OCU_ACTIONS]);
 
 // The fixed tools open-computer-use can serve: no browser tabs, paste or select_text,
 // whole trees instead of diffs, and scrolling by element only.
-function ocuToolDefs() {
-  const scrollProps = { element: elementProp, direction: ACTIONS.scroll.props.direction, pages: ACTIONS.scroll.props.pages };
+// The fixed tools open-computer-use can serve: whole trees instead of diffs, no paste or
+// select_text, and scrolling apps by element only. With tabs, open-browser-use serves the tab tools.
+function ocuToolDefs(tabs) {
+  const scrollProps = tabs
+    ? ACTIONS.scroll.props
+    : { element: elementProp, direction: ACTIONS.scroll.props.direction, pages: ACTIONS.scroll.props.pages };
   const itemProps = Object.assign({}, ...OCU_ACTIONS.map((n) => (n === "scroll" ? scrollProps : ACTIONS[n].props)), {
     action: { type: "string", enum: [...OCU_ACTIONS, "wait"] },
     name: batchItemProps.name,
     ms: batchItemProps.ms,
   });
-  return TOOL_DEFS.filter((d) => OCU_TOOLS.has(d.name)).map((d) => {
+  const names = new Set([...OCU_TOOLS, ...(tabs ? OBU_TOOLS : [])]);
+  return TOOL_DEFS.filter((d) => names.has(d.name)).map((d) => {
     const props = { ...d.props };
-    delete props.tab;
+    if (!tabs) delete props.tab;
     let { description, required } = d;
-    description = description.replace("Returns a diff of the tree.", "Returns the window's tree.");
+    description = description.replace("Returns a diff of the tree.", "Returns the window's or tab's tree.");
     if (d.name === "scroll") {
-      delete props.x;
-      delete props.y;
-      required = ["element", "direction"];
-      description = "Scroll an element by pages. Returns the window's tree.";
+      if (!tabs) {
+        delete props.x;
+        delete props.y;
+      }
+      props.element = elementProp;
+      required = tabs ? ["direction"] : ["element", "direction"];
+      description = tabs
+        ? "Scroll by pages: an app element, or in a tab an element, coordinates [x, y] or the page. Returns the tree."
+        : "Scroll an element by pages. Returns the window's tree.";
+    } else if (d.name === "secondary_action" && tabs) {
+      description = "Perform an app element's listed secondary action (e.g. Raise, Copy, Increment); apps only. Returns the window's tree.";
     } else if (d.name === "get_state") {
       delete props.full;
       delete props.rebind;
-      description = "Return the accessibility tree of an app's key window, with numbered elements. Element numbers are valid until the next call.";
+      description = `Return the accessibility tree of an app's key window${tabs ? " or of an agent tab" : ""}, with numbered elements. Element numbers are valid until the next call.`;
     } else if (d.name === "screenshot") {
-      description = "Screenshot of the app's key window.";
+      description = `Screenshot of the app's key window${tabs ? " or of an agent tab" : ""}.`;
     } else if (d.name === "release") {
-      description = "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Stops the engine; the next call restarts it.";
+      description = "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Stops the engine and detaches agent tabs (they stay open); the next call restarts it.";
     } else if (d.name === "batch") {
       props.actions = { ...props.actions, items: { ...props.actions.items, properties: itemProps } };
       description = "Run up to 25 actions in order in one call (click, type_text, press_key, set_value, scroll, drag, secondary_action, or wait with ms), then return the tree once. Stops at the first failing step. Element numbers are from the tree before the batch, so prefer coordinates or stable elements for later steps.";
+    } else if (d.name === "list_tabs") {
+      description = "List agent tabs (the ones you can act on) and the user's tabs (title and URL only; agents cannot act on them).";
+      delete props.browser;
+    } else if (d.name === "open_tab") {
+      description = "Open a URL in a new background tab (in the agent's tab group) and return its tab ID and tree. Never touches the user's tabs or focus.";
+      delete props.browser;
+    } else if (d.name === "eval_tab") {
+      description = "Evaluate a JavaScript expression in an agent tab and return the JSON result. Read-only: the browser rejects any expression with side effects (DOM writes, events, network, storage).";
+    } else if (OBU_TOOLS.includes(d.name)) {
+      description = description.replace(/\ba tab\b/, "an agent tab");
     }
     return { ...d, props, description, required };
   });
@@ -1192,17 +1635,41 @@ function ocuToolDefs() {
 class OcuSession extends Session {
   constructor(cfg, label) {
     super(cfg, label);
-    this.tools = ocuToolDefs().map(toolSchema);
+    // Tabs need the browser that runs the open-browser-use extension to be allowed.
+    this.tabsOn = cfg.isAllowed(cfg.obuBrowser ?? "com.brave.Browser");
+    this.tools = ocuToolDefs(this.tabsOn).map(toolSchema);
+    this.obu = null;
   }
 
   newChild() {
     return new OcuChild(this.cfg, this.label);
   }
 
+  engineRunning() {
+    return !!this.child || !!this.obu;
+  }
+
+  browser() {
+    this.obu ??= new ObuBrowser(this.cfg, this.label);
+    return this.obu;
+  }
+
+  async stopEngine(why) {
+    const b = this.obu;
+    this.obu = null;
+    if (b) {
+      log(`[${this.label}] detaching agent tabs (${why})`);
+      await b.close();
+    }
+    return (await super.stopEngine(why)) || !!b;
+  }
+
   instructions() {
     return `Computer use on the Mac "${hostname()}" through open-computer-use (open source; no OpenAI service). Allowed apps: ${this.cfg.allowApps.join(", ") || "(none)"}. ` +
       "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
-      "There are no browser-tab tools: drive a browser through its window (press_key super+t, super+l, type_text, Return). " +
+      (this.tabsOn
+        ? "For web pages, use tabs: open_tab opens a background tab in the agent's tab group; pass its tab ID instead of app to get_state, screenshot, batch and the actions; read_tab, eval_tab and tab_locator work on tabs. You can act only on tabs you opened; the user's tabs are listed but off limits. "
+        : "There are no browser-tab tools. ") +
       "Use batch to run several actions in one call. Screenshots come only from screenshot or get_state with screenshot: true; coordinates you give refer to the image you received. " +
       "Call release when you finish with computer use. Input goes to the target without moving the user's cursor, but the user may be using the same window. " +
       "Ask the user before sending messages, submitting forms, purchasing, or transmitting sensitive data.";
@@ -1228,6 +1695,176 @@ class OcuSession extends Session {
 
   callFixed(name, a) {
     return this.callFixedOnce(name, a);
+  }
+
+  async tabAction(b, tab, name, a) {
+    switch (name) {
+      case "click": return b.click(tab, a);
+      case "type_text": return b.cdp(tab, "Input.insertText", { text: str(a.text, "text") });
+      case "press_key":
+        if (!/^[A-Za-z0-9_+\-]{1,40}$/.test(a.key ?? "")) throw new BadInput("key must look like Return, super+a or KP_0");
+        return b.key(tab, a.key);
+      case "set_value": return b.setValue(tab, b.node(tab, a.element), str(a.value, "value"));
+      case "scroll": return b.scroll(tab, a);
+      case "drag": return b.drag(tab, a);
+      case "secondary_action": throw new BadInput("secondary_action works on apps only; in a tab use click or tab_locator");
+      default: throw new BadInput(`unknown action ${name}`);
+    }
+  }
+
+  // Browser tabs through open-browser-use; only agent tabs can be read or changed.
+  async callTab(name, a, { cap, maxWidth }) {
+    const b = this.browser();
+    const out = async (tab, head = "", { image = false, isError = false } = {}) => {
+      await sleep(300);
+      const res = await this.shape({ content: [{ type: "text", text: head + await b.tree(tab) }] }, `tab:${tab}`, { cap, maxWidth });
+      if (image) {
+        const s = await b.screenshot(tab, maxWidth);
+        res.content.push(s.block);
+        if (s.scale !== 1) res.content.push({ type: "text", text: `Screenshot scaled from ${s.width} to ${maxWidth} px wide; give coordinates from this image.` });
+      }
+      res.isError = isError;
+      return res;
+    };
+    const trunc = (s, max) => (s.length > max ? `${s.slice(0, max)}\n[truncated: ${s.length} characters total]` : s);
+    if (name === "list_tabs") {
+      const limit = a.limit === undefined ? 50 : int(a.limit, "limit");
+      const agent = await b.agentTabs();
+      const ids = new Set(agent.map((t) => t.id));
+      const user = (await b.userTabs()).filter((t) => !ids.has(t.id)).slice(0, limit);
+      const row = (t, mine) => ({ tab: String(t.id), agent: mine, title: t.title, url: t.url });
+      return textResult(JSON.stringify([...agent.map((t) => row(t, true)), ...user.map((t) => row(t, false))], null, 1));
+    }
+    if (name === "open_tab") {
+      const tab = await b.openTab(httpUrl(a.url));
+      return out(tab, `Opened tab ${tab}.\n`);
+    }
+    if (a.tab === undefined) throw new BadInput("give tab");
+    const tab = await b.requireAgentTab(str(a.tab, "tab", 64));
+    switch (name) {
+      case "get_state": return out(tab, "", { image: a.screenshot === true });
+      case "screenshot": {
+        const s = await b.screenshot(tab, maxWidth);
+        const content = [s.block];
+        if (s.scale !== 1) content.push({ type: "text", text: `Screenshot scaled from ${s.width} to ${maxWidth} px wide; give coordinates from this image.` });
+        return { content, isError: false };
+      }
+      case "navigate_tab": {
+        if (a.action === "goto") {
+          const r = await b.cdp(tab, "Page.navigate", { url: httpUrl(a.url) });
+          if (r.errorText) throw new Error(`navigation failed: ${r.errorText}`);
+        } else if (a.action === "back" || a.action === "forward") {
+          const h = await b.cdp(tab, "Page.getNavigationHistory");
+          const entry = h.entries[h.currentIndex + (a.action === "back" ? -1 : 1)];
+          if (!entry) throw new BadInput(`no page to go ${a.action} to`);
+          await b.cdp(tab, "Page.navigateToHistoryEntry", { entryId: entry.id });
+        } else if (a.action === "reload") await b.cdp(tab, "Page.reload");
+        else throw new BadInput("action must be goto, back, forward or reload");
+        await sleep(300);
+        await b.waitLoad(tab);
+        return out(tab, `Now at ${await b.eval(tab, "location.href")}\n`);
+      }
+      case "close_tab": {
+        b.elements.delete(tab);
+        await b.cdp(tab, "Page.close");
+        b.attached.delete(tab);
+        return textResult(`Closed tab ${tab}`);
+      }
+      case "read_tab": {
+        const max = a.max_chars === undefined ? 20_000 : int(a.max_chars, "max_chars");
+        const format = a.format ?? "text";
+        let text;
+        if (format === "dom") text = await b.eval(tab, "document.documentElement.outerHTML");
+        else if (format === "text") {
+          const sel = opt(a.selector, "selector", 2000);
+          text = await b.eval(tab, `(() => { const e = ${sel ? `document.querySelector(${J(sel)})` : "document.body"}; return e ? e.innerText : null; })()`);
+          if (text === null) throw new BadInput(`selector ${sel} matched nothing`);
+        } else throw new BadInput("format must be text or dom");
+        return textResult(trunc(String(text ?? ""), max));
+      }
+      case "eval_tab": {
+        const max = a.max_chars === undefined ? 20_000 : int(a.max_chars, "max_chars");
+        // throwOnSideEffect makes V8 reject anything that would change state, as in a read-only sandbox.
+        const r = await b.cdp(tab, "Runtime.evaluate", { expression: str(a.expression, "expression"), returnByValue: true, throwOnSideEffect: true, timeout: 5000 });
+        if (r.exceptionDetails) {
+          const msg = r.exceptionDetails.exception?.description ?? r.exceptionDetails.text ?? "evaluation failed";
+          return textResult(/side-effect/i.test(msg) ? `eval_tab is read-only and this expression would have side effects (${msg.split("\n")[0]})` : msg, true);
+        }
+        const v = r.result?.value;
+        return textResult(trunc(v === undefined ? "undefined" : JSON.stringify(v, null, 1) ?? String(v), max));
+      }
+      case "tab_locator": {
+        const ids = await b.locate(tab, a);
+        if (a.action === "count") return textResult(String(ids.length));
+        if (!ids.length) throw new BadInput("no element matches the locator");
+        let id = ids[0];
+        if (a.nth !== undefined) {
+          const n = int(a.nth, "nth");
+          if (n >= ids.length) throw new BadInput(`only ${ids.length} element(s) match`);
+          id = ids[n];
+        } else if (ids.length > 1) throw new BadInput(`${ids.length} elements match; give nth (0-based) or a more specific locator`);
+        const value = () => str(a.value, "value");
+        const focus = () => b.call(tab, id, "function () { this.focus(); }");
+        const press = async (n) => {
+          const at = await b.center(tab, id);
+          if (!at) return b.call(tab, id, n === 2 ? "function () { this.click(); this.click(); this.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); }" : "function () { this.click(); }");
+          await b.mouse(tab, "mouseMoved", at);
+          for (let i = 1; i <= n; i++) {
+            await b.mouse(tab, "mousePressed", at, { button: "left", buttons: 1, clickCount: i });
+            await b.mouse(tab, "mouseReleased", at, { button: "left", buttons: 0, clickCount: i });
+          }
+        };
+        switch (a.action) {
+          case "text": return textResult(trunc(String(await b.call(tab, id, "function () { return this.innerText ?? this.textContent; }") ?? ""), 20_000));
+          case "click": await press(1); break;
+          case "dblclick": await press(2); break;
+          case "fill": await b.setValue(tab, id, value()); break;
+          case "type": await focus(); await b.cdp(tab, "Input.insertText", { text: value() }); break;
+          case "press": await focus(); await b.key(tab, pwKey(value())); break;
+          case "check": case "uncheck": {
+            const on = await b.call(tab, id, "function () { return this.checked ?? this.getAttribute('aria-checked') === 'true'; }");
+            if (on !== (a.action === "check")) await press(1);
+            break;
+          }
+          case "select_option":
+            await b.call(tab, id, `function (v) {
+  const o = [...(this.options ?? [])].find((o) => o.value === v || o.label === v || o.text === v);
+  if (!o) throw new Error("no option " + v);
+  this.value = o.value;
+  this.dispatchEvent(new Event("input", { bubbles: true }));
+  this.dispatchEvent(new Event("change", { bubbles: true }));
+}`, [value()]);
+            break;
+          default: throw new BadInput("action must be click, dblclick, fill, type, press, check, uncheck, select_option, text or count");
+        }
+        return out(tab);
+      }
+      case "batch": {
+        if (!Array.isArray(a.actions) || a.actions.length < 1 || a.actions.length > 25) throw new BadInput("actions must hold 1 to 25 steps");
+        for (const [i, s] of a.actions.entries()) {
+          if (typeof s !== "object" || s === null) throw new BadInput(`step ${i + 1} must be an object`);
+          if (s.action !== "wait" && !OCU_ACTIONS.includes(s.action)) throw new BadInput(`step ${i + 1}: unknown action ${s.action}`);
+        }
+        for (const [i, s] of a.actions.entries()) {
+          const { action, name: actionName, ...rest } = s;
+          try {
+            if (action === "wait") {
+              const ms = int(rest.ms ?? 500, "ms");
+              if (ms > 10_000) throw new BadInput("ms must be at most 10000");
+              await sleep(ms);
+            } else await this.tabAction(b, tab, action, action === "secondary_action" ? { ...rest, action: actionName } : rest);
+          } catch (e) {
+            return out(tab, `Batch stopped at step ${i + 1} (${action}): ${e.message}\n`, { isError: true });
+          }
+        }
+        return out(tab, "", { image: a.screenshot === true });
+      }
+      default:
+        await this.tabAction(b, tab, name, a);
+        await sleep(200);
+        await b.waitLoad(tab);
+        return out(tab);
+    }
   }
 
   // The engine's tool name and arguments for one action; coordinates are mapped from the
@@ -1303,9 +1940,13 @@ class OcuSession extends Session {
 
   async callFixedOnce(name, a) {
     if (!this.tools.some((t) => t.name === name)) throw new BadInput(`unknown tool ${name}`);
-    if (a.tab !== undefined) throw new BadInput("this server runs open-computer-use, which has no browser-tab tools; give app");
     const maxWidth = this.maxWidth(a);
     const cap = this.treeCap(name, a);
+    if (OBU_TOOLS.includes(name) || a.tab !== undefined) {
+      if (!this.tabsOn) throw new BadInput("browser tabs are not available on this server");
+      if (a.app !== undefined && a.tab !== undefined) throw new BadInput("give app or tab, not both");
+      return this.callTab(name, a, { cap, maxWidth });
+    }
     const ocu = async (tool, args, timeoutMs = 60_000) => (await this.cua()).call(tool, args, timeoutMs);
     switch (name) {
       case "release":
