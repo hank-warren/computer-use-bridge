@@ -1,6 +1,6 @@
 # Updated by .github/workflows/release.yml when a v* tag is pushed.
 class ComputerUseBridge < Formula
-  desc "Use ChatGPT's Codex computer use from any MCP client over your tailnet"
+  desc "Let MCP clients use your Mac's apps and browser tabs over your tailnet"
   homepage "https://github.com/hank-warren/computer-use-bridge"
   url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.4.1.tar.gz"
   sha256 "65d50697f3e4a8be6a3e6412f97ee06cbc2e1f4d3fb0eb95598fb63e360f3128"
@@ -8,24 +8,23 @@ class ComputerUseBridge < Formula
   head "https://github.com/hank-warren/computer-use-bridge.git", branch: "main"
 
   depends_on :macos
+  depends_on "node"
 
   def install
     libexec.install "computer-use-bridge.mjs"
-    # Runs on ChatGPT.app's bundled Node, which every Mac with Codex computer use has.
     (bin/"computer-use-bridge").write <<~SH
       #!/bin/bash
-      NODE="/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node"
-      if [[ ! -x "$NODE" ]]; then
-        echo "computer-use-bridge: ChatGPT.app with Codex computer use is required ($NODE not found)" >&2
-        exit 1
-      fi
-      exec "$NODE" "#{opt_libexec}/computer-use-bridge.mjs" "$@"
+      exec "#{formula_opt_bin("node")}/node" "#{opt_libexec}/computer-use-bridge.mjs" "$@"
     SH
   end
 
   def caveats
     <<~EOS
-      Requires ChatGPT.app with Computer Use set up in Codex.
+      Install the engines it drives, then grant open-computer-use its permissions:
+        npm i -g open-computer-use open-browser-use
+        open-computer-use
+      For browser tabs (Brave or Chrome), register the native host and add the extension:
+        open-browser-use install-manifest --browser chrome
       Configure the server and start it:
         computer-use-bridge setup
       Upgrade and restart the service in one step:
@@ -36,15 +35,13 @@ class ComputerUseBridge < Formula
   service do
     run [opt_bin/"computer-use-bridge", "serve"]
     keep_alive true
+    environment_variables PATH: std_service_path_env
     process_type :interactive
     log_path var/"log/computer-use-bridge.log"
     error_log_path var/"log/computer-use-bridge.log"
   end
 
   test do
-    assert_path_exists libexec/"computer-use-bridge.mjs"
-    if File.exist?("/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node")
-      assert_match version.to_s, shell_output("#{bin}/computer-use-bridge --version")
-    end
+    assert_match version.to_s, shell_output("#{bin}/computer-use-bridge --version")
   end
 end
