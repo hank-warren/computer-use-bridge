@@ -14,7 +14,7 @@ class ComputerUseBridge < Formula
     libexec.install "computer-use-bridge.mjs"
     (bin/"computer-use-bridge").write <<~SH
       #!/bin/bash
-      exec "#{Formula["node"].opt_bin}/node" "#{opt_libexec}/computer-use-bridge.mjs" "$@"
+      exec "#{formula_opt_bin("node")}/node" "#{opt_libexec}/computer-use-bridge.mjs" "$@"
     SH
   end
 
