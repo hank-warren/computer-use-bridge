@@ -1450,6 +1450,14 @@ class ObuBrowser {
     return null;
   }
 
+  // The extension's overlay cursor, so a watching user sees where input lands. Animations
+  // do not run in hidden tabs, so only wait for arrival when the tab is visible.
+  async showCursor(tab, at, wait = true) {
+    if (this.cfg.obuCursor === false) return;
+    const visible = await this.eval(tab, "document.visibilityState === 'visible'").catch(() => false);
+    await this.request("moveMouse", { tabId: tab, x: at.x, y: at.y, waitForArrival: wait && visible }, 5000).catch(() => {});
+  }
+
   async mouse(tab, type, at, extra = {}) {
     await this.cdp(tab, "Input.dispatchMouseEvent", { type, x: at.x, y: at.y, ...extra });
   }
@@ -1461,6 +1469,7 @@ class ObuBrowser {
     if (!["left", "right", "middle"].includes(button)) throw new BadInput("button must be left, right or middle");
     const count = a.count === undefined ? 1 : int(a.count, "count");
     if (!t.at) return this.call(tab, t.id, "function () { this.click(); }");
+    await this.showCursor(tab, t.at);
     await this.mouse(tab, "mouseMoved", t.at);
     for (let i = 1; i <= count; i++) {
       await this.mouse(tab, "mousePressed", t.at, { button, buttons: { left: 1, right: 2, middle: 4 }[button], clickCount: i });
@@ -1516,11 +1525,13 @@ class ObuBrowser {
   async drag(tab, a) {
     const from = this.point(tab, a.from_x, a.from_y);
     const to = this.point(tab, a.to_x, a.to_y);
+    await this.showCursor(tab, from);
     await this.mouse(tab, "mouseMoved", from);
     await this.mouse(tab, "mousePressed", from, { button: "left", buttons: 1, clickCount: 1 });
     for (let i = 1; i <= 5; i++) {
       await this.mouse(tab, "mouseMoved", { x: from.x + ((to.x - from.x) * i) / 5, y: from.y + ((to.y - from.y) * i) / 5 }, { button: "left", buttons: 1 });
     }
+    await this.showCursor(tab, to);
     await this.mouse(tab, "mouseReleased", to, { button: "left", buttons: 0, clickCount: 1 });
   }
 
@@ -1808,6 +1819,7 @@ class OcuSession extends Session {
         const press = async (n) => {
           const at = await b.center(tab, id);
           if (!at) return b.call(tab, id, n === 2 ? "function () { this.click(); this.click(); this.dispatchEvent(new MouseEvent('dblclick', { bubbles: true })); }" : "function () { this.click(); }");
+          await b.showCursor(tab, at);
           await b.mouse(tab, "mouseMoved", at);
           for (let i = 1; i <= n; i++) {
             await b.mouse(tab, "mousePressed", at, { button: "left", buttons: 1, clickCount: i });
