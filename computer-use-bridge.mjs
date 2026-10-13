@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.5.0";
+const VERSION = "0.5.1";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
