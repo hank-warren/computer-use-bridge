@@ -226,12 +226,12 @@ const TOOL_DEFS = [
   {
     name: "list_tabs",
     readOnly: true,
-    description: "List agent tabs (the ones you can act on) and the user's tabs (title and URL only; agents cannot act on them).",
+    description: "List your agent tabs (the ones you can act on) and the browser's other tabs: the user's and other agents' (title and URL only; you cannot act on them).",
     props: { limit: { type: "integer", minimum: 1, maximum: 1000, description: "Most user tabs to list (default 50)." } },
   },
   {
     name: "open_tab",
-    description: "Open a URL in a new background tab (in the agent's tab group) and return its tab ID and tree. Never touches the user's tabs or focus.",
+    description: "Open a URL in a new background tab (in your own tab group) and return its tab ID and tree. Never touches the user's tabs or focus.",
     props: { url: { type: "string" } },
     required: ["url"],
   },
@@ -449,7 +449,8 @@ class OcuChild {
 
 // open-browser-use (github.com/iFurySt/open-browser-use) is a browser extension plus a native
 // host that relays CDP for the tabs of a session. Agent tabs open in the background in the session's
-// tab group of the focused window; the user's own tabs are never claimed.
+// tab group of the focused window; the user's own tabs are never claimed. Each bridge session has its
+// own open-browser-use session, so agents cannot see or act on each other's tabs.
 const OBU_SESSION = "computer-use-bridge";
 const OBU_REGISTRY = "/tmp/open-browser-use/active.json";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -520,9 +521,12 @@ function pwKey(k) {
 }
 
 class ObuBrowser {
-  constructor(cfg, label) {
+  // session: { id, name } of the open-browser-use session; name titles its tab group.
+  constructor(cfg, label, session = { id: OBU_SESSION }) {
     this.cfg = cfg;
     this.label = label;
+    this.session = session;
+    this.named = !session.name;
     this.sock = null;
     this.buf = Buffer.alloc(0);
     this.next = 1;
@@ -553,7 +557,7 @@ class ObuBrowser {
       if (this.sock === sock) this.sock = null;
     });
     this.sock = sock;
-    if (this.label !== "check") log(`[${this.label}] open-browser-use connected`);
+    if (this.label !== "check") log(`[${this.label}] open-browser-use connected (session ${this.session.id})`);
   }
 
   // Frames are a 4-byte native-endian length and a JSON message.
@@ -577,7 +581,7 @@ class ObuBrowser {
   async request(method, params = {}, timeoutMs = 20_000) {
     await this.connect();
     const id = String(this.next++);
-    const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, method, params: { session_id: OBU_SESSION, turn_id: OBU_SESSION, ...params } }));
+    const body = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id, method, params: { session_id: this.session.id, turn_id: this.session.id, ...params } }));
     const head = Buffer.alloc(4);
     head[endianness() === "LE" ? "writeUInt32LE" : "writeUInt32BE"](body.length, 0);
     return new Promise((resolve, reject) => {
@@ -638,6 +642,10 @@ class ObuBrowser {
 
   // The extension's default: a background tab in the focused window, in the session's tab group.
   async openTab(url) {
+    if (!this.named) {
+      await this.request("nameSession", { name: this.session.name }).catch(() => {});
+      this.named = true;
+    }
     const tab = (await this.request("createTab")).id;
     await this.cdp(tab, "Page.navigate", { url });
     await this.waitLoad(tab, true);
@@ -879,6 +887,9 @@ class Session {
     this.label = label;
     this.child = null; // open-computer-use, for apps
     this.obu = null; // open-browser-use, for tabs
+    // Kept for the life of the session, so its tabs survive release and the idle stop.
+    const short = randomUUID().slice(0, 8);
+    this.obuSession = { id: `${OBU_SESSION}-${short}`, name: `Agent ${short}` };
     this.starting = null;
     this.appNames = null;
     this.lastUsed = Date.now();
@@ -914,7 +925,7 @@ class Session {
   }
 
   browser() {
-    this.obu ??= new ObuBrowser(this.cfg, this.label);
+    this.obu ??= new ObuBrowser(this.cfg, this.label, this.obuSession);
     return this.obu;
   }
 
@@ -977,7 +988,7 @@ class Session {
       "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
       "Reading an app whose window is minimized or on another Space brings it forward, so prefer apps the user has on screen. " +
       (this.tabsOn
-        ? "For web pages, use tabs: open_tab opens a background tab in the agent's tab group; pass its tab ID instead of app to get_state, screenshot, batch and the actions; read_tab, eval_tab and tab_locator work on tabs. You can act only on tabs you opened; the user's tabs are listed but off limits. "
+        ? "For web pages, use tabs: open_tab opens a background tab in your own tab group; pass its tab ID instead of app to get_state, screenshot, batch and the actions; read_tab, eval_tab and tab_locator work on tabs. You can act only on tabs you opened; the user's tabs and other agents' tabs are listed but off limits. "
         : "There are no browser-tab tools. ") +
       "Use batch to run several actions in one call. Screenshots come only from screenshot or get_state with screenshot: true; coordinates you give refer to the image you received. " +
       "Call release when you finish with computer use. Input goes to the target without moving the user's cursor, but the user may be using the same window. " +
@@ -1046,7 +1057,7 @@ class Session {
     }
     if (name === "open_tab") {
       const tab = await b.openTab(httpUrl(a.url));
-      return out(tab, `Opened tab ${tab}.\n`);
+      return out(tab, `Opened tab ${tab} in tab group "${b.session.name}".\n`);
     }
     if (a.tab === undefined) throw new BadInput("give tab");
     const tab = await b.requireAgentTab(str(a.tab, "tab", 64));

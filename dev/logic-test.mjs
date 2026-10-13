@@ -101,6 +101,34 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   assert(e.isError, "tab tools are refused without an allowed browser");
 }
 
+// 4b. Each session has its own open-browser-use session, kept across engine stops.
+{
+  const cfg = config(["com.brave.Browser"]);
+  const wire = (b) => {
+    const sent = [];
+    b.connect = async () => {};
+    b.sock = { write: (buf) => sent.push(JSON.parse(buf.subarray(4).toString("utf8"))) };
+    return sent;
+  };
+  const a = new Session(cfg, "a"), c = new Session(cfg, "c");
+  const ids = [a, c].map((s) => s.browser().session.id);
+  assert(ids[0] !== ids[1] && ids.every((id) => id.startsWith("computer-use-bridge-")), "sessions get distinct open-browser-use sessions");
+  const sent = wire(a.browser());
+  await a.browser().request("getTabs", {}, 1).catch(() => {});
+  assert(sent[0].params.session_id === ids[0] && sent[0].params.turn_id === ids[0], "requests carry the session's id");
+  await a.stopEngine("idle");
+  assert(a.obu === null && a.browser().session.id === ids[0], "the id survives an idle stop");
+  const b = a.browser();
+  const calls = [];
+  b.request = async (method, params) => { calls.push([method, params]); return method === "createTab" ? { id: 7 } : {}; };
+  b.cdp = async () => ({});
+  b.waitLoad = async () => {};
+  await b.openTab("https://a/");
+  await b.openTab("https://a/");
+  const names = calls.filter(([m]) => m === "nameSession");
+  assert(calls[0][0] === "nameSession" && names.length === 1 && names[0][1].name === a.obuSession.name, "the tab group is named once, before the first tab");
+}
+
 // 5. The tab tree: numbering, flattening and element mapping.
 {
   const nodes = [
