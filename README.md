@@ -148,8 +148,8 @@ If your tailnet uses ACLs, the client must be allowed to reach `<mac>:47800`.
 
 **Browser tabs**
 
-- `open_tab(url)` opens a background tab in the agent's tab group, in the
-  browser window you used last. `navigate_tab` and `close_tab` work on agent
+- `open_tab(url)` opens a background tab in the agent's own tab group, in
+  the browser window you used last. `navigate_tab` and `close_tab` work on agent
   tabs. Pass `tab` instead of `app` to `get_state`, `screenshot`, `batch` and
   the actions.
 - `read_tab` returns page text or HTML; `eval_tab` evaluates an expression
@@ -159,7 +159,9 @@ If your tailnet uses ACLs, the client must be allowed to reach `<mac>:47800`.
 - `list_tabs` lists agent tabs and, by title and URL only, your own.
 
 Agents can only act on tabs they opened. Your tabs are never attached,
-grouped or changed. Clicks in a tab show the extension's cursor, so you can
+grouped or changed, and each client session (a pi session, a subagent, a
+`stdio` process) has its own tab group, so agents cannot act on each other's
+tabs either. Clicks in a tab show the extension's cursor, so you can
 watch what the agent does.
 
 **Session**
@@ -215,9 +217,10 @@ run `brew services restart computer-use-bridge`.
 
 ## What you'll see
 
-- **Agent tabs** appear in the background in a tab group, in the browser
-  window you used last. They stay open after `release`; close them when you
-  like.
+- **Agent tabs** appear in the background in a tab group named for the
+  session (`Agent 3f2a91c0`), in the browser window you used last. They stay
+  open after `release` and after the session ends; close them when you like.
+  A new session cannot act on an earlier session's tabs.
 - **A debugging notice**: while an agent tab is attached, the browser says
   Open Browser Use is debugging it, until `release` or the idle stop.
 
