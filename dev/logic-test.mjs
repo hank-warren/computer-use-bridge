@@ -129,6 +129,32 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   assert(calls[0][0] === "nameSession" && names.length === 1 && names[0][1].name === a.obuSession.name, "the tab group is named once, before the first tab");
 }
 
+// 4c. Held keys in tabs: down without up, up later, and let go on release.
+{
+  const cfg = config(["com.brave.Browser", "com.hnc.Discord"]);
+  const s = new Session(cfg, "t");
+  const keys = [];
+  s.obu = fakeBrowser(cfg, [5], async (m, p) => {
+    if (m === "Input.dispatchKeyEvent") keys.push(`${p.type} ${p.key}`);
+    if (m === "Accessibility.getFullAXTree") return { nodes: [{ nodeId: "1", role: { value: "RootWebArea" }, name: { value: "P" } }] };
+    return {};
+  });
+  await s.callTool("batch", { tab: "5", actions: [{ action: "press_key", key: "Up", hold: "down" }, { action: "press_key", key: "Left" }] });
+  assert(keys.join(",") === "rawKeyDown ArrowUp,rawKeyDown ArrowLeft,keyUp ArrowLeft", "hold: down presses without letting go");
+  assert(s.obu.held.get(5)?.size === 1, "the held key is tracked");
+  await s.callTool("batch", { tab: "5", actions: [{ action: "press_key", key: "Up", hold: "up" }] });
+  assert(keys.at(-1) === "keyUp ArrowUp" && s.obu.held.get(5).size === 0, "hold: up lets go");
+  await s.callTool("batch", { tab: "5", actions: [{ action: "press_key", key: "Down", hold: "down" }] });
+  keys.length = 0;
+  await s.obu.releaseKeys();
+  assert(keys.join(",") === "keyUp ArrowDown" && s.obu.held.size === 0, "releasing lets go of held keys");
+  const bad = await s.callTool("press_key", { tab: "5", key: "Up", hold: "sideways" });
+  assert(bad.isError && /hold must be/.test(text(bad)), "an unknown hold is refused");
+  s.cua = async () => { throw new Error("engine must not run"); };
+  const app = await s.callTool("press_key", { app: "com.hnc.Discord", key: "Up", hold: "down" });
+  assert(app.isError && /tabs only/.test(text(app)), "hold is refused for apps");
+}
+
 // 5. The tab tree: numbering, flattening and element mapping.
 {
   const nodes = [

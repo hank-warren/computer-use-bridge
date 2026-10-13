@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.5.1";
+const VERSION = "0.5.2";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
@@ -139,8 +139,8 @@ const ACTIONS = {
   },
   type_text: { description: "Type text into the focused element.", props: { text: { type: "string" } }, required: ["text"] },
   press_key: {
-    description: "Press a key or combination, xdotool syntax: Return, Tab, Escape, Up, super+a (Cmd+A), shift+Tab.",
-    props: { key: { type: "string" } },
+    description: "Press a key or combination, xdotool syntax: Return, Tab, Escape, Up, super+a (Cmd+A), shift+Tab. In a tab, hold: down keeps the key pressed (games, e.g. Up to accelerate) until press_key with hold: up or release.",
+    props: { key: { type: "string" }, hold: { type: "string", enum: ["down", "up"], description: "Tabs only: down presses and holds the key; up lets it go. Omit to press and release." } },
     required: ["key"],
   },
   set_value: { description: "Set a settable element's value (e.g. a text field).", props: { element: elementProp, value: { type: "string" } }, required: ["element", "value"] },
@@ -187,7 +187,7 @@ const TOOL_DEFS = [
   { name: "list_apps", readOnly: true, description: "List the apps this bridge may control and whether they are running.", props: {} },
   {
     name: "release",
-    description: "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Detaches agent tabs (they stay open) and stops the engine; the next call restarts it.",
+    description: "Release computer use when you are done for now: at the end of a task, or before waiting more than a few minutes. Lets go of held keys, detaches agent tabs (they stay open) and stops the engine; the next call restarts it.",
     props: {},
   },
   {
@@ -533,6 +533,7 @@ class ObuBrowser {
     this.pending = new Map();
     this.attached = new Set();
     this.elements = new Map(); // tab -> Map(element number -> backendDOMNodeId)
+    this.held = new Map(); // tab -> Map(key code -> keyUp event) for keys held down
     this.scales = new Map(); // tab -> CSS px per screenshot px
   }
 
@@ -554,6 +555,7 @@ class ObuBrowser {
       for (const p of this.pending.values()) p.reject(new Error("open-browser-use connection closed"));
       this.pending.clear();
       this.attached.clear();
+      this.held.clear();
       if (this.sock === sock) this.sock = null;
     });
     this.sock = sock;
@@ -775,10 +777,26 @@ class ObuBrowser {
     }
   }
 
-  async key(tab, spec) {
+  // hold: "down" leaves the key pressed until "up" or releaseKeys; otherwise press and release.
+  async key(tab, spec, hold) {
     const k = cdpKey(spec);
-    await this.cdp(tab, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", ...k });
-    await this.cdp(tab, "Input.dispatchKeyEvent", { type: "keyUp", key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode, modifiers: k.modifiers });
+    const up = { type: "keyUp", key: k.key, code: k.code, windowsVirtualKeyCode: k.windowsVirtualKeyCode, modifiers: k.modifiers };
+    const id = k.code || k.key;
+    if (hold !== "up") await this.cdp(tab, "Input.dispatchKeyEvent", { type: k.text ? "keyDown" : "rawKeyDown", ...k });
+    if (hold === "down") {
+      if (!this.held.has(tab)) this.held.set(tab, new Map());
+      this.held.get(tab).set(id, up);
+      return;
+    }
+    await this.cdp(tab, "Input.dispatchKeyEvent", up);
+    this.held.get(tab)?.delete(id);
+  }
+
+  async releaseKeys() {
+    for (const [tab, keys] of this.held) {
+      for (const up of keys.values()) await this.cdp(tab, "Input.dispatchKeyEvent", up).catch(() => {});
+    }
+    this.held.clear();
   }
 
   async setValue(tab, backendNodeId, value) {
@@ -873,6 +891,7 @@ class ObuBrowser {
 
   async close() {
     if (!this.sock) return;
+    await this.releaseKeys();
     await this.detachAll().catch(() => {});
     this.sock?.end();
     this.sock = null;
@@ -1023,7 +1042,8 @@ class Session {
       case "type_text": return b.cdp(tab, "Input.insertText", { text: str(a.text, "text") });
       case "press_key":
         if (!/^[A-Za-z0-9_+\-]{1,40}$/.test(a.key ?? "")) throw new BadInput("key must look like Return, super+a or KP_0");
-        return b.key(tab, a.key);
+        if (a.hold !== undefined && a.hold !== "down" && a.hold !== "up") throw new BadInput("hold must be down or up");
+        return b.key(tab, a.key, a.hold);
       case "set_value": return b.setValue(tab, b.node(tab, a.element), str(a.value, "value"));
       case "scroll": return b.scroll(tab, a);
       case "drag": return b.drag(tab, a);
@@ -1086,6 +1106,7 @@ class Session {
       }
       case "close_tab": {
         b.elements.delete(tab);
+        b.held.delete(tab);
         await b.cdp(tab, "Page.close");
         b.attached.delete(tab);
         return textResult(`Closed tab ${tab}`);
@@ -1210,6 +1231,7 @@ class Session {
       case "type_text": return ["type_text", { app: id, text: str(a.text, "text") }];
       case "press_key":
         if (!/^[A-Za-z0-9_+\-]{1,40}$/.test(a.key ?? "")) throw new BadInput("key must look like Return, super+t or KP_0");
+        if (a.hold !== undefined) throw new BadInput("hold works in tabs only");
         return ["press_key", { app: id, key: a.key }];
       case "set_value": return ["set_value", { app: id, element_index: el(a.element), value: str(a.value, "value") }];
       case "scroll": {
@@ -1272,7 +1294,7 @@ class Session {
     switch (name) {
       case "release":
         return textResult(await this.stopEngine("released")
-          ? "Released: agent tabs detached (they stay open) and the engine stopped. The next call restarts it."
+          ? "Released: held keys let go, agent tabs detached (they stay open) and the engine stopped. The next call restarts it."
           : "Nothing to release; the engine is not running.");
       case "list_apps": {
         const ids = this.cfg.approve === "all" ? null : this.cfg.allowApps.map((x) => x.toLowerCase());

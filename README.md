@@ -156,6 +156,8 @@ If your tailnet uses ACLs, the client must be allowed to reach `<mac>:47800`.
   that may not change anything.
 - `tab_locator` clicks, fills or reads elements by CSS, role, text, label,
   placeholder or test ID.
+- `press_key` with `hold: "down"` keeps a key pressed in a tab until
+  `hold: "up"` or `release`, for games: hold `Up`, tap `Left` to steer.
 - `list_tabs` lists agent tabs and, by title and URL only, your own.
 
 Agents can only act on tabs they opened. Your tabs are never attached,
@@ -166,7 +168,8 @@ watch what the agent does.
 
 **Session**
 
-- `release` detaches agent tabs (they stay open) and stops the engine. Agents
+- `release` lets go of held keys, detaches agent tabs (they stay open) and
+  stops the engine. Agents
   should call it when they finish. The bridge also does this after
   `engineIdleMinutes` without a call; the next call restarts the engine in
   about a second.
