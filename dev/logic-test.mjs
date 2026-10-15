@@ -3,6 +3,7 @@
 // rules that keep agents to allowed apps and their own tabs. Loads computer-use-bridge.mjs
 // without its CLI entry point and replaces open-computer-use and open-browser-use with fakes.
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -198,4 +199,44 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   try { cdpKey("hyper+a"); } catch { threw = true; }
   assert(threw, "an unknown modifier is refused");
   assert(pwKey("Control+A") === "ctrl+A" && pwKey("Enter") === "Return" && pwKey("Shift+ArrowDown") === "shift+Down", "Playwright key names map to xdotool");
+}
+
+// 8. Finding the open-browser-use socket when active.json is missing or stale.
+{
+  const dir = mkdtempSync(join(tmpdir(), "cub-obu-"));
+  const reg = join(dir, "active.json");
+  const servers = [];
+  const listen = (name) => new Promise((resolve) => {
+    const s = createServer((c) => c.on("error", () => {})).listen(join(dir, name), () => resolve(join(dir, name)));
+    servers.push(s);
+  });
+  const attempt = async (cfg) => {
+    const b = new ObuBrowser({ obuRegistry: reg, ...cfg }, "check");
+    try { await b.connect(); return { ok: true, scanned: b.scanned }; } catch (e) { return { ok: false, error: e.message }; } finally { b.sock?.destroy(); }
+  };
+  try {
+    writeFileSync(join(dir, "dead.sock"), "");
+    let r = await attempt({});
+    assert(!r.ok && /not connected/.test(r.error) && /no live socket/.test(r.error), "no registry and no live socket is a clear error");
+    const a = await listen("a.sock");
+    r = await attempt({});
+    assert(r.ok && r.scanned.includes(a) && r.scanned.includes("no "), "no registry: the only live socket is used, skipping dead ones");
+    writeFileSync(reg, JSON.stringify({ socketPath: join(dir, "gone.sock") }));
+    r = await attempt({});
+    assert(r.ok && /unreachable/.test(r.scanned), "registry naming a dead socket falls back to the scan");
+    writeFileSync(reg, JSON.stringify({ socketPath: a }));
+    r = await attempt({});
+    assert(r.ok && r.scanned === null, "a working registry is used without scanning");
+    const b = await listen("b.sock");
+    writeFileSync(reg, "{");
+    r = await attempt({});
+    assert(!r.ok && /2 browsers/.test(r.error) && r.error.includes(a) && r.error.includes(b), "two live sockets without a registry are refused");
+    r = await attempt({ obuSocket: b });
+    assert(r.ok && r.scanned === null, "obuSocket picks one");
+    r = await attempt({ obuSocket: join(dir, "gone.sock") });
+    assert(!r.ok && /obuSocket/.test(r.error), "an unreachable obuSocket does not fall back");
+  } finally {
+    for (const s of servers) s.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
