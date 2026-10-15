@@ -12,7 +12,7 @@
 
 import { execFile, spawn } from "node:child_process";
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { createConnection } from "node:net";
@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.5.2";
+const VERSION = "0.5.3";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
@@ -455,6 +455,47 @@ const OBU_SESSION = "computer-use-bridge";
 const OBU_REGISTRY = "/tmp/open-browser-use/active.json";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function dialSocket(path, timeoutMs = 1000) {
+  return new Promise((resolve, reject) => {
+    const sock = createConnection(path);
+    const timer = setTimeout(() => { sock.destroy(); reject(new Error("timed out")); }, timeoutMs);
+    sock.once("connect", () => { clearTimeout(timer); resolve(sock); });
+    sock.once("error", (e) => { clearTimeout(timer); sock.destroy(); reject(e); });
+  });
+}
+
+// Connects to the open-browser-use native host: obuSocket if set, else the socket active.json
+// names, else the only live socket beside it. macOS's nightly tmp_cleaner deletes active.json
+// three days after the host wrote it while the host keeps listening, so the registry can vanish.
+// Several live sockets mean several browsers; refuse to guess which one the agent should drive.
+async function findObuSocket(cfg) {
+  if (cfg.obuSocket) {
+    const path = expand(cfg.obuSocket);
+    try { return { sock: await dialSocket(path), path, how: "obuSocket" }; } catch (e) {
+      throw new Error(`cannot reach open-browser-use at obuSocket ${path} (${e.message}); is the browser running with its extension connected?`);
+    }
+  }
+  const file = expand(cfg.obuRegistry ?? OBU_REGISTRY);
+  let registered = null;
+  let why = `no ${file}`;
+  try { registered = JSON.parse(readFileSync(file, "utf8")).socketPath ?? null; } catch {}
+  if (registered) {
+    try { return { sock: await dialSocket(registered), path: registered, how: "registry" }; } catch (e) {
+      why = `${file} names ${registered}, which is unreachable (${e.message})`;
+    }
+  } else if (existsSync(file)) why = `${file} is unreadable or has no socketPath`;
+  const dir = dirname(file);
+  let paths = [];
+  try { paths = readdirSync(dir).filter((n) => n.endsWith(".sock")).map((n) => join(dir, n)).filter((p) => p !== registered); } catch {}
+  const live = (await Promise.all(paths.map((path) => dialSocket(path).then((sock) => ({ sock, path }), () => null)))).filter(Boolean);
+  if (live.length === 1) return { ...live[0], how: "scan", why };
+  for (const l of live) l.sock.destroy();
+  if (live.length) {
+    throw new Error(`open-browser-use registry is unusable (${why}) and ${live.length} browsers are listening (${live.map((l) => l.path).join(", ")}); set obuSocket in the config to choose one`);
+  }
+  throw new Error(`open-browser-use is not connected (${why}; no live socket in ${dir}); install it, enable its extension in the browser, or quit and reopen the browser`);
+}
+
 // xdotool key name -> [key, code, keyCode, text]
 const CDP_KEYS = {
   Return: ["Enter", "Enter", 13, "\r"], KP_Enter: ["Enter", "NumpadEnter", 13, "\r"], Tab: ["Tab", "Tab", 9],
@@ -528,6 +569,7 @@ class ObuBrowser {
     this.session = session;
     this.named = !session.name;
     this.sock = null;
+    this.scanned = null; // why the registry was bypassed, when the socket came from a scan
     this.buf = Buffer.alloc(0);
     this.next = 1;
     this.pending = new Map();
@@ -539,16 +581,9 @@ class ObuBrowser {
 
   async connect() {
     if (this.sock) return;
-    const file = expand(this.cfg.obuRegistry ?? OBU_REGISTRY);
-    let reg;
-    try { reg = JSON.parse(readFileSync(file, "utf8")); } catch {
-      throw new Error(`open-browser-use is not connected (no ${file}); install it, add its extension to the browser, and restart the browser`);
-    }
-    const sock = createConnection(reg.socketPath);
-    await new Promise((resolve, reject) => {
-      sock.once("connect", resolve);
-      sock.once("error", (e) => reject(new Error(`cannot reach open-browser-use (${e.message}); is the browser running with its extension connected?`)));
-    });
+    const { sock, path, how, why } = await findObuSocket(this.cfg);
+    this.scanned = how === "scan" ? `${why}; using ${path}` : null;
+    if (this.scanned && this.label !== "check") log(`[${this.label}] open-browser-use registry unusable (${why}); found ${path} by scanning`);
     sock.on("error", () => {});
     sock.on("data", (d) => this.onData(d));
     sock.on("close", () => {
@@ -1679,7 +1714,8 @@ async function prerequisites(cfg) {
   const b = new ObuBrowser(cfg, "check");
   try {
     const tabs = await b.userTabs();
-    add(true, `open-browser-use extension connected (${tabs.length} tabs)`);
+    if (b.scanned) out.push({ ok: true, warn: true, what: `open-browser-use extension connected (${tabs.length} tabs) by socket scan: ${b.scanned}`, fix: "optional: disable and re-enable the extension so its native host rewrites active.json" });
+    else add(true, `open-browser-use extension connected (${tabs.length} tabs)`);
   } catch (e) {
     add(false, `open-browser-use extension is not connected: ${e.message}`, `install the Open Browser Use extension in your browser (${OBU_STORE}), then quit and reopen the browser`);
   } finally {
@@ -1873,7 +1909,7 @@ async function setup(opts) {
     say(`Wrote ${file}`);
 
     say("\nChecking open-computer-use and open-browser-use...");
-    for (const c of await prerequisites(cfg)) say(c.ok ? `  ok    ${c.what}` : `  FAIL  ${c.what}\n        fix: ${c.fix}`);
+    for (const c of await prerequisites(cfg)) say(c.ok && !c.warn ? `  ok    ${c.what}` : `  ${c.ok ? "warn" : "FAIL"}  ${c.what}\n        fix: ${c.fix}`);
 
     const brew = brewPath();
     const managed = brew && (await run(brew, ["list", "--formula", NAME])).ok;
@@ -1972,8 +2008,9 @@ async function status(opts) {
     for (const t of h?.tunnels ?? []) line(t.up, `tunnel: ${t.ssh} port ${t.remotePort} ${t.up ? "up" : `down: ${t.error}`}`);
   }
   for (const c of await prerequisites(cfg ?? {})) {
-    line(c.ok, c.what);
-    if (!c.ok) say(`      fix: ${c.fix}`);
+    if (c.warn) say(`warn  ${c.what}`);
+    else line(c.ok, c.what);
+    if (!c.ok || c.warn) say(`      fix: ${c.fix}`);
   }
   return bad ? 1 : 0;
 }

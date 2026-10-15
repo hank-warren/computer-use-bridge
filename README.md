@@ -216,6 +216,7 @@ run `brew services restart computer-use-bridge`.
 | `obuCursor` | `false` hides the cursor drawn in tabs. |
 | `ocuVisualCursor` | `true` shows open-computer-use's on-screen cursor for app clicks (default off). |
 | `ocuCommand` | Path to `open-computer-use`, if `setup` cannot find it. |
+| `obuSocket` | open-browser-use socket to use, when several browsers run its extension (see `ls /tmp/open-browser-use`). |
 | `tunnels` | Reverse SSH tunnels, e.g. `[{"ssh": "devvm", "remotePort": 47801}]`. |
 
 ## What you'll see
@@ -254,6 +255,12 @@ machine over SSH", or use `setup --tunnel devvm:47801`.
 - **"open-browser-use is not connected"**: the extension isn't running. Check
   that it is installed and enabled, that the native host is registered (step
   3), and quit and reopen the browser.
+- **"connected ... by socket scan"** in `status`: `/tmp/open-browser-use/active.json`
+  is gone, usually because macOS's nightly `/tmp` cleaner removes it three days
+  after the browser started. The bridge finds the live socket itself, so tabs
+  keep working; disabling and re-enabling the extension rewrites the file. If
+  several browsers run the extension, the bridge refuses to guess: set
+  `obuSocket`.
 - **"not an agent tab"**: agents can only use tabs they opened; use
   `open_tab`.
 - **"Grouping is not supported by tabs in this window"**: the last window you
