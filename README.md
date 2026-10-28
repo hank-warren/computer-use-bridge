@@ -16,6 +16,8 @@ locally and need no account:
 The bridge serves them over your tailnet (or SSH) with a token, an app
 allowlist and a fixed set of tools.
 
+On Linux it serves browser tabs only; see [Linux](#linux-browser-tabs-only).
+
 ## Install
 
 On the Mac you want to control you need [Homebrew](https://brew.sh). For
@@ -95,6 +97,77 @@ computer-use-bridge update   # upgrade and restart
 **Upgrading from 0.4**, which ran on ChatGPT's engine: follow steps 1 to 3,
 then run `setup` again. It keeps your settings and token and drops the old
 `engine` key. ChatGPT is no longer needed.
+
+## Linux (browser tabs only)
+
+open-computer-use controls apps only on macOS, so on Linux the bridge serves
+the tab tools alone: `list_apps`, `launch_app` and `secondary_action` are
+gone, and every other tool takes `tab`. There is no Homebrew formula, and
+`setup` and `update` are macOS-only, so the steps are manual. The examples use
+Brave and a systemd user service; you need Node 20 or later.
+
+**1. open-browser-use.** Install it, register its native host in Brave's own
+folder (Linux Brave does not read Chrome's), then add
+[Open Browser Use](https://chromewebstore.google.com/detail/open-browser-use/bgjoihaepiejlfjinojjfgokghnodnhd)
+to one Brave profile:
+
+```bash
+npm i -g open-browser-use
+open-browser-use install-manifest \
+  --output ~/.config/BraveSoftware/Brave-Browser/NativeMessagingHosts/com.ifuryst.open_browser_use.extension.json
+open-browser-use ping   # pong once the extension connects
+```
+
+The manifest points at the Node that ran `install-manifest`; run it again after
+changing Node versions. For Chrome, use `~/.config/google-chrome/` instead.
+
+**2. The bridge, a token and the config.** `allowApps` must list the browser;
+that is what turns the tab tools on.
+
+```bash
+git clone https://github.com/hank-warren/computer-use-bridge ~/.local/share/computer-use-bridge
+mkdir -p ~/.config/computer-use-bridge && chmod 700 ~/.config/computer-use-bridge
+(umask 077; openssl rand -hex 32 > ~/.config/computer-use-bridge/token)
+cat > ~/.config/computer-use-bridge/config.json <<EOF
+{
+  "host": "$(tailscale ip -4)",
+  "port": 47800,
+  "tokenFile": "$HOME/.config/computer-use-bridge/token",
+  "allowApps": ["com.brave.Browser"]
+}
+EOF
+```
+
+**3. The service.** Use the absolute path of the Node you want (`command -v
+node`). systemd starts it at boot when lingering is on (`loginctl
+enable-linger`), but the browser must be running with the extension for the
+tools to work.
+
+```ini
+# ~/.config/systemd/user/computer-use-bridge.service
+[Unit]
+Description=computer-use-bridge (browser tabs over MCP)
+After=network-online.target
+
+[Service]
+ExecStart=/path/to/node %h/.local/share/computer-use-bridge/computer-use-bridge.mjs serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now computer-use-bridge
+node ~/.local/share/computer-use-bridge/computer-use-bridge.mjs status
+```
+
+If it starts before Tailscale has an address, it exits and restarts on its
+own. To update: `git -C ~/.local/share/computer-use-bridge pull` and `systemctl
+--user restart computer-use-bridge`. Clients connect as in
+[Connect a client](#connect-a-client); copy the token without printing it.
 
 ## Connect a client
 
@@ -206,7 +279,7 @@ run `brew services restart computer-use-bridge`.
 | Key | Meaning |
 |---|---|
 | `host`, `port` | Listen address. |
-| `allowApps` | Bundle IDs clients may control. Find one with `osascript -e 'id of app "Brave Browser"'`. `com.brave.Browser` or `com.google.Chrome` turns on the tab tools. |
+| `allowApps` | Bundle IDs clients may control. Find one with `osascript -e 'id of app "Brave Browser"'`. `com.brave.Browser` or `com.google.Chrome` turns on the tab tools (on Linux, the only use of this key). |
 | `idleMinutes` | Close a client session after this long without a request (default 30). |
 | `maxSessions` | Most client sessions at once; the least recently used is closed beyond this (default 4). |
 | `engineIdleMinutes` | Stop a session's engine after this long without a call (default 10; 0 never). |
@@ -247,7 +320,8 @@ machine over SSH", or use `setup --tunnel devvm:47801`.
 ## Troubleshooting
 
 - `computer-use-bridge status` checks everything and prints fixes.
-- Log: `tail -f /opt/homebrew/var/log/computer-use-bridge.log`.
+- Log: `tail -f /opt/homebrew/var/log/computer-use-bridge.log` (Linux:
+  `journalctl --user -u computer-use-bridge -f`).
 - **"open-computer-use not found"**: `npm i -g open-computer-use`, or set
   `ocuCommand` to its path (`npm prefix -g` shows where npm installs).
 - **"Accessibility permission is required"**: run `open-computer-use doctor`
