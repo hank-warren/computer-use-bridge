@@ -2,8 +2,8 @@
 class ComputerUseBridge < Formula
   desc "Let MCP clients use your Mac's apps and browser tabs over your tailnet"
   homepage "https://github.com/hank-warren/computer-use-bridge"
-  url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.5.3.tar.gz"
-  sha256 "2b6d304fae0c745bb25ef653003536c13a798cbfad4e59efc51f82cfe2ebbc90"
+  url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.6.0.tar.gz"
+  sha256 "fba46f4ee3d0967669bc052fe5eadd7314c7f2d7dd6782c8c42bf55fbdce0347"
   license "MIT"
   head "https://github.com/hank-warren/computer-use-bridge.git", branch: "main"
 
