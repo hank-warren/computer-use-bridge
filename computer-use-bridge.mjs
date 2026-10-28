@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.5.3";
+const VERSION = "0.6.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
@@ -30,6 +30,9 @@ const DEFAULT_PORT = 47800;
 // Browsers open-browser-use runs in (Brave reads Chrome's native-messaging folder); tab tools
 // need one of them allowed.
 const BROWSERS = ["com.brave.Browser", "com.google.Chrome"];
+// open-computer-use drives apps on macOS only; elsewhere (Linux) the bridge serves browser tabs alone.
+const APPS_SUPPORTED = process.platform === "darwin";
+const TABS_ONLY_HINT = `this system has no app control, only browser tabs: add ${BROWSERS[0]} (or ${BROWSERS[1]}) to allowApps to turn them on`;
 
 // Never controllable, even if listed in allowApps:
 // shells, script runners, credential stores, system settings and mail/messages.
@@ -107,6 +110,8 @@ function loadConfig(opts) {
   cfg.allowApps = (cfg.allowApps ?? []).filter((id) => !HARD_DENY.has(id.toLowerCase()));
   const allowed = new Set(cfg.allowApps.map((id) => id.toLowerCase()));
   cfg.isAllowed = (id) => cfg.approve === "all" || (typeof id === "string" && allowed.has(id.toLowerCase()));
+  cfg.appsOn = APPS_SUPPORTED;
+  if (!cfg.appsOn && !BROWSERS.some(cfg.isAllowed)) throw new Error(`${file}: ${TABS_ONLY_HINT}`);
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
   cfg.engineIdleMinutes ??= 10;
@@ -268,8 +273,28 @@ const TOOL_DEFS = [
   },
 ];
 
+const APP_TOOLS = ["list_apps", "launch_app", "secondary_action"];
+
+// Without app control (Linux) every tool works on tabs, so tab is required and app is gone.
+function tabOnlyDefs() {
+  const { name: _name, ...items } = batchItemProps;
+  items.action = { type: "string", enum: [...Object.keys(ACTIONS).filter((n) => !APP_TOOLS.includes(n)), "wait"] };
+  return TOOL_DEFS.filter((d) => !APP_TOOLS.includes(d.name)).map((d) => {
+    const props = { ...d.props };
+    delete props.app;
+    if (d.name === "batch") {
+      props.actions = { ...props.actions, items: { ...props.actions.items, properties: items } };
+      return { ...d, props, required: ["tab", "actions"], description: "Run up to 25 actions in an agent tab in order in one call (click, type_text, press_key, set_value, scroll, drag, or wait with ms), then return the tree once. Stops at the first failing step." };
+    }
+    const required = props.tab && !(d.required ?? []).includes("tab") ? ["tab", ...(d.required ?? [])] : d.required;
+    return { ...d, props, required };
+  });
+}
+
 // Without an allowed browser there are no tab tools, and app tools take only app.
-function toolDefs(tabs) {
+// Without app control there are only tab tools.
+function toolDefs(tabs, apps = true) {
+  if (!apps) return tabs ? tabOnlyDefs() : [];
   if (tabs) return TOOL_DEFS;
   return TOOL_DEFS.filter((d) => !TAB_TOOLS.includes(d.name)).map((d) => {
     const props = { ...d.props };
@@ -886,14 +911,18 @@ class ObuBrowser {
     await this.mouse(tab, "mouseReleased", to, { button: "left", buttons: 0, clickCount: 1 });
   }
 
+  // The browser scales the capture itself (clip.scale), so no image tool is needed.
   async screenshot(tab, maxWidth) {
     const vp = (await this.cdp(tab, "Page.getLayoutMetrics")).cssLayoutViewport;
-    const shot = await this.cdp(tab, "Page.captureScreenshot", { format: "jpeg", quality: 75 });
+    const dpr = Number(await this.eval(tab, "devicePixelRatio")) || 1;
+    const width = Math.round(vp.clientWidth * dpr);
+    const factor = maxWidth && width > maxWidth ? maxWidth / width : 1;
+    const clip = factor !== 1 ? { clip: { x: vp.pageX, y: vp.pageY, width: vp.clientWidth, height: vp.clientHeight, scale: factor } } : {};
+    const shot = await this.cdp(tab, "Page.captureScreenshot", { format: "jpeg", quality: 75, ...clip });
     const block = { type: "image", mimeType: "image/jpeg", data: shot.data };
-    const scaled = await scaleImage(block, maxWidth);
-    const sent = scaled.scale !== 1 ? maxWidth : imageWidth(Buffer.from(shot.data, "base64"));
+    const sent = imageWidth(Buffer.from(shot.data, "base64"));
     if (sent) this.scales.set(tab, vp.clientWidth / sent);
-    return scaled;
+    return { block, scale: factor === 1 ? 1 : width / (sent ?? maxWidth), width };
   }
 
   // Elements matched by a tab_locator spec, as backend node IDs.
@@ -951,7 +980,8 @@ class Session {
     this.busy = 0;
     this.notice = null;
     this.tabsOn = BROWSERS.some((id) => cfg.isAllowed(id));
-    this.tools = toolDefs(this.tabsOn).filter((t) => t.name !== "eval_tab" || cfg.tabEval !== false).map(toolSchema);
+    this.appsOn = cfg.appsOn ?? APPS_SUPPORTED;
+    this.tools = toolDefs(this.tabsOn, this.appsOn).filter((t) => t.name !== "eval_tab" || cfg.tabEval !== false).map(toolSchema);
     // The engine holds screen capture and tab attachments while it runs, so it is
     // stopped when idle; the MCP session stays open and restarts it on demand.
     const idleMs = cfg.engineIdleMinutes * 60_000;
@@ -1038,6 +1068,14 @@ class Session {
   }
 
   instructions() {
+    if (!this.appsOn) {
+      return `Browser use on "${hostname()}" through its browser's tabs; there is no desktop app control. ` +
+        "open_tab opens a background tab in your own tab group and returns its tab ID; pass that tab to get_state, screenshot, batch and the actions. " +
+        "Element numbers refer to the latest tree and change after every call; actions return the tab's tree. read_tab, eval_tab and tab_locator read and act on tabs too. " +
+        "You can act only on tabs you opened; the user's tabs and other agents' tabs are listed but off limits. " +
+        "Use batch to run several actions in one call. Screenshots come only from screenshot or get_state with screenshot: true; coordinates you give refer to the image you received. " +
+        "Call release when you finish. Ask the user before sending messages, submitting forms, purchasing, or transmitting sensitive data.";
+    }
     return `Computer use on the Mac "${hostname()}". Allowed apps: ${this.cfg.allowApps.join(", ") || "(none)"}. ` +
       "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
       "Reading an app whose window is minimized or on another Space brings it forward, so prefer apps the user has on screen. " +
@@ -1325,6 +1363,7 @@ class Session {
       if (a.app !== undefined && a.tab !== undefined) throw new BadInput("give app or tab, not both");
       return this.callTab(name, a, { cap, maxWidth });
     }
+    if (!this.appsOn && name !== "release") throw new BadInput("this server has browser tabs only; give tab (from open_tab or list_tabs)");
     const ocu = async (tool, args, timeoutMs = 60_000) => (await this.cua()).call(tool, args, timeoutMs);
     switch (name) {
       case "release":
@@ -1587,7 +1626,7 @@ function runHttp(cfg) {
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
   const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
   server.listen(cfg.port, cfg.host, () => {
-    log(`serving on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ")}`);
+    log(`serving on http://${cfg.host}:${cfg.port}/mcp; ${cfg.appsOn ? `apps: ${cfg.allowApps.join(", ")}` : "browser tabs only"}`);
     for (const t of tunnels) t.start();
   });
   const stop = async () => {
@@ -1685,7 +1724,14 @@ async function health(host, port, waitMs = 0, tokenFile) {
   }
 }
 
-const OBU_MANIFEST = join(homedir(), "Library/Application Support/Google/Chrome/NativeMessagingHosts/com.ifuryst.open_browser_use.extension.json");
+// Where browsers look for open-browser-use's native host. On macOS Brave reads Chrome's folder; on Linux each has its own.
+const OBU_HOST = "NativeMessagingHosts/com.ifuryst.open_browser_use.extension.json";
+const OBU_MANIFESTS = APPS_SUPPORTED
+  ? [join(homedir(), "Library/Application Support/Google/Chrome", OBU_HOST)]
+  : [join(homedir(), ".config/BraveSoftware/Brave-Browser", OBU_HOST), join(homedir(), ".config/google-chrome", OBU_HOST)];
+const OBU_MANIFEST_FIX = APPS_SUPPORTED
+  ? "npm i -g open-browser-use && open-browser-use install-manifest --browser chrome (also for Brave, which reads Chrome's folder)"
+  : `npm i -g open-browser-use && open-browser-use install-manifest --output ~/${OBU_MANIFESTS[0].slice(homedir().length + 1)} (Brave; Chrome uses ~/.config/google-chrome)`;
 const OBU_STORE = "https://chromewebstore.google.com/detail/open-browser-use/bgjoihaepiejlfjinojjfgokghnodnhd";
 
 // What the bridge needs on this Mac: [{ ok, what, fix }].
@@ -1693,7 +1739,9 @@ async function prerequisites(cfg) {
   const out = [];
   const add = (ok, what, fix) => out.push({ ok, what, fix });
   const ocu = findOcu(cfg);
-  if (!existsSync(ocu)) {
+  if (!APPS_SUPPORTED) {
+    add(true, `apps: off (open-computer-use runs on macOS only; ${process.platform} gets browser tabs)`);
+  } else if (!existsSync(ocu)) {
     add(false, "open-computer-use is not installed", "npm i -g open-computer-use, then run open-computer-use once and grant it Accessibility and Screen Recording");
   } else {
     const r = await run(ocu, ["doctor"], 30_000);
@@ -1706,11 +1754,12 @@ async function prerequisites(cfg) {
   }
   const allowed = new Set((cfg.allowApps ?? []).map((id) => id.toLowerCase()));
   if (!BROWSERS.some((id) => allowed.has(id.toLowerCase()))) {
-    add(true, `browser tabs: off (allow ${BROWSERS.join(" or ")} to use them)`);
+    if (APPS_SUPPORTED) add(true, `browser tabs: off (allow ${BROWSERS.join(" or ")} to use them)`);
+    else add(false, "browser tabs: off, so there is nothing to serve", TABS_ONLY_HINT);
     return out;
   }
-  add(existsSync(OBU_MANIFEST), `open-browser-use native host ${existsSync(OBU_MANIFEST) ? "registered" : "is not registered"}`,
-    "npm i -g open-browser-use && open-browser-use install-manifest --browser chrome (also for Brave, which reads Chrome's folder)");
+  const manifest = OBU_MANIFESTS.find((f) => existsSync(f));
+  add(!!manifest, `open-browser-use native host ${manifest ? `registered (${manifest})` : "is not registered"}`, OBU_MANIFEST_FIX);
   const b = new ObuBrowser(cfg, "check");
   try {
     const tabs = await b.userTabs();
@@ -1786,6 +1835,7 @@ async function setup(opts) {
     return a ? /^y/i.test(a) : def;
   };
   try {
+    if (!APPS_SUPPORTED) throw new Error(`setup is macOS-only; on ${process.platform}, write ${DEFAULT_CONFIG} by hand and run "${NAME} serve" as a service (see the README's Linux section)`);
     say(`${NAME} ${VERSION} setup\n`);
 
     // Older installs used ~/.config/codex-cu-bridge and their own LaunchAgent.
@@ -1967,6 +2017,7 @@ function sshWrite(dest, command, data) {
 
 // brew upgrade does not restart services, so this does both.
 async function update() {
+  if (!APPS_SUPPORTED) throw new Error(`update is macOS-only; on ${process.platform}, update the checkout (git pull) and restart your service`);
   const brew = brewPath();
   if (!brew || !(await run(brew, ["list", "--formula", NAME])).ok) throw new Error(`${NAME} was not installed through Homebrew`);
   const step = (args) => new Promise((resolve, reject) => {

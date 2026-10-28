@@ -21,7 +21,7 @@ const assert = (c, m) => { if (!c) { console.log("FAIL", m); process.exitCode = 
 const text = (r) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 const config = (allowApps) => {
   const ids = new Set(allowApps.map((x) => x.toLowerCase()));
-  return { engineIdleMinutes: 0, approve: "allowlist", allowApps, isAllowed: (id) => typeof id === "string" && ids.has(id.toLowerCase()) };
+  return { engineIdleMinutes: 0, approve: "allowlist", appsOn: true, allowApps, isAllowed: (id) => typeof id === "string" && ids.has(id.toLowerCase()) };
 };
 
 // 1. Tool definitions.
@@ -154,6 +154,48 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   s.cua = async () => { throw new Error("engine must not run"); };
   const app = await s.callTool("press_key", { app: "com.hnc.Discord", key: "Up", hold: "down" });
   assert(app.isError && /tabs only/.test(text(app)), "hold is refused for apps");
+}
+
+// 4d. Without app control (Linux): tab tools only, tab required, apps refused before the engine runs.
+{
+  const cfg = { ...config(["com.brave.Browser"]), appsOn: false };
+  const s = new Session(cfg, "t");
+  const tools = s.listTools();
+  const names = tools.map((t) => t.name);
+  assert(!names.includes("list_apps") && !names.includes("launch_app") && !names.includes("secondary_action") && names.includes("open_tab") && names.includes("release"), "tabs-only tools");
+  assert(tools.every((t) => !t.inputSchema.properties.app), "no app parameter");
+  assert(tools.filter((t) => t.inputSchema.properties.tab).every((t) => t.inputSchema.required.includes("tab")), "tab required wherever it is accepted");
+  assert(tools.every((t) => t.inputSchema.required.every((k) => k in t.inputSchema.properties)), "every required parameter is defined");
+  const steps = tools.find((t) => t.name === "batch").inputSchema.properties.actions.items;
+  assert(!steps.properties.action.enum.includes("secondary_action") && !steps.properties.name, "batch steps without secondary_action");
+  assert(toolDefs(false, false).length === 0, "no tools without tabs or apps");
+  s.cua = async () => { throw new Error("engine must not run"); };
+  const r = await s.callTool("get_state", { app: "com.brave.Browser" });
+  assert(r.isError && /tabs only/.test(text(r)), "app calls are refused");
+  assert(!(await s.callTool("release", {})).isError, "release works");
+  assert(/no desktop app control/.test(s.instructions()), "tabs-only instructions");
+}
+
+// 4e. Tab screenshots are scaled by the browser, and coordinates map back.
+{
+  const jpeg = (w) => { const b = Buffer.alloc(32); b.set([0xff, 0xd8, 0xff, 0xc0, 0, 17, 8, 0, 100]); b.writeUInt16BE(w, 9); return b.toString("base64"); };
+  const run = async (dpr, maxWidth) => {
+    const shots = [];
+    const b = fakeBrowser(config(["com.brave.Browser"]), [5], async (m, p) => {
+      if (m === "Page.getLayoutMetrics") return { cssLayoutViewport: { clientWidth: 1000, clientHeight: 800, pageX: 0, pageY: 40 } };
+      if (m === "Runtime.evaluate") return { result: { value: dpr } };
+      if (m === "Page.captureScreenshot") { shots.push(p); return { data: jpeg(Math.round(1000 * dpr * (p.clip?.scale ?? 1))) }; }
+      return {};
+    });
+    return { s: await b.screenshot(5, maxWidth), shots, map: b.scales.get(5) };
+  };
+  let r = await run(1, 1280);
+  assert(r.s.scale === 1 && !r.shots[0].clip && r.map === 1, "narrow tabs are not scaled");
+  r = await run(2, 1280);
+  assert(r.shots[0].clip?.scale === 0.64 && r.shots[0].clip.y === 40 && r.s.scale === 2000 / 1280 && r.s.width === 2000, "wide tabs are scaled by the browser");
+  assert(r.map === 1000 / 1280, "screenshot pixels map back to CSS pixels");
+  r = await run(2, 0);
+  assert(!r.shots[0].clip && r.s.scale === 1 && r.map === 0.5, "max_width 0 keeps full size");
 }
 
 // 5. The tab tree: numbering, flattening and element mapping.

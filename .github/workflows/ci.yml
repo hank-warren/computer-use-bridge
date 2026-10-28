@@ -9,6 +9,20 @@ permissions:
   contents: read
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Syntax, tests and CLI (tabs only)
+        run: |
+          node --check computer-use-bridge.mjs
+          node dev/logic-test.mjs
+          node computer-use-bridge.mjs --version
+          if node computer-use-bridge.mjs setup --yes; then echo "setup must refuse on Linux" >&2; exit 1; fi
+
   check:
     runs-on: macos-latest
     steps:
