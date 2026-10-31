@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
 import { chmodSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface as createPrompt } from "node:readline/promises";
 import { CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, VERSION, expand, lastLine, readJson, run, say, sleep, writePrivate } from "./common.mjs";
@@ -468,10 +468,15 @@ export async function status(opts) {
   } catch (e) {
     add({ ok: false, what: `config: ${e.message}`, fix: `run "${NAME} setup"` });
   }
+  // Look for engines where the service would: beside its node (nvm keeps globals there).
+  const sc = serviceCommand();
+  if (sc?.node && existsSync(sc.node) && sc.node !== process.execPath) {
+    process.env.PATH = `${dirname(sc.node)}:${process.env.PATH ?? ""}`;
+    report.serviceNode = sc.node;
+  }
   const svc = await serviceState();
   report.service = svc;
   add(svc.installed ? { ok: svc.running, what: `service ${svc.detail}`, fix: `see ${logHint()}` } : { ok: false, what: "service not installed", fix: `run "${NAME} setup" (or run "${NAME} serve" yourself)` });
-  const sc = serviceCommand();
   if (sc?.node && !existsSync(sc.node)) add({ ok: false, what: `the service runs ${sc.node}, which no longer exists (Node was upgraded or switched)`, fix: `run "${NAME} setup --yes" to point it at this Node` });
   if (sc?.script && !existsSync(sc.script)) add({ ok: false, what: `the service runs ${sc.script}, which no longer exists`, fix: `run "${NAME} setup --yes"` });
   if (svc.installed && !MAC && !(await linger())) add({ ok: true, warn: true, what: "lingering is off: the service stops at logout and does not start at boot", fix: `sudo loginctl enable-linger ${process.env.USER ?? "$USER"}` });
@@ -486,7 +491,7 @@ export async function status(opts) {
   }
   if (opts.json) say(JSON.stringify(report, null, 2));
   else {
-    say(`${NAME} ${VERSION} on ${report.host}`);
+    say(`${NAME} ${VERSION} on ${report.host}${report.serviceNode ? ` (the service runs ${report.serviceNode})` : ""}`);
     printChecks(report.checks);
   }
   return report.ok ? 0 : 1;

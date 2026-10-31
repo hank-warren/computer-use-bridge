@@ -98,7 +98,8 @@ export function serviceCommand() {
     return { file: f, node: args[i + 1], script: args[i + 2] };
   }
   const m = /^ExecStart=("([^"]*)"|\S+) ("([^"]*)"|\S+)/m.exec(text);
-  return m ? { file: f, node: m[2] ?? m[1], script: m[4] ?? m[3] } : { file: f };
+  const spec = (s) => s?.replace(/%h/g, homedir()).replace(/%u/g, userInfo().username);
+  return m ? { file: f, node: spec(m[2] ?? m[1]), script: spec(m[4] ?? m[3]) } : { file: f };
 }
 
 const uid = () => userInfo().uid;

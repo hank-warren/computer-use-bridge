@@ -14,9 +14,9 @@ const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
 
 // A remote command line that finds computer-use-bridge and its node even in a non-login SSH shell
 // (npm global bins and Homebrew are often only on the login PATH).
-export function remoteCommand(args) {
+export function remoteCommand(args, bin) {
   const tail = args.map(shq).join(" ");
-  return `for c in "$(command -v ${NAME} 2>/dev/null)" "$HOME/.npm-global/bin/${NAME}" /opt/homebrew/bin/${NAME} /usr/local/bin/${NAME} "$HOME/.local/bin/${NAME}" "$HOME"/.nvm/versions/node/*/bin/${NAME}; do ` +
+  return `for c in ${bin ? `${shq(bin)} ` : ""}"$(command -v ${NAME} 2>/dev/null)" "$HOME/.npm-global/bin/${NAME}" /opt/homebrew/bin/${NAME} /usr/local/bin/${NAME} "$HOME/.local/bin/${NAME}" "$HOME"/.nvm/versions/node/*/bin/${NAME}; do ` +
     `if [ -x "$c" ]; then PATH="$(dirname "$c"):/opt/homebrew/bin:/usr/local/bin:$PATH" exec "$c" ${tail}; fi; done; echo "${NAME} is not installed there (npm i -g ${NAME})" >&2; exit 127`;
 }
 
@@ -58,7 +58,7 @@ export async function connect(opts) {
   const dest = opts.host;
   if (!dest || !/^[A-Za-z0-9_][A-Za-z0-9_.@-]{0,252}$/.test(dest)) throw new Error("connect needs an SSH destination, e.g. connect pikachu or connect me@my-mac");
   say(`Asking ${dest} for its ${NAME} settings over SSH...`);
-  const r = await sshOut(dest, remoteCommand(["client-info", "--with-token", ...(opts.remoteConfig ? ["--config", opts.remoteConfig] : [])]));
+  const r = await sshOut(dest, remoteCommand(["client-info", "--with-token", ...(opts.remoteConfig ? ["--config", opts.remoteConfig] : [])], opts.remoteBin));
   if (!r.ok) throw new Error(`ssh ${dest} failed: ${lastLine(r.err) || "no output"}`);
   let info;
   try { info = JSON.parse(r.out.trim().split("\n").pop()); } catch { throw new Error(`unexpected answer from ${dest}: ${lastLine(r.err || r.out)}`); }
@@ -88,7 +88,7 @@ export async function connect(opts) {
 
   const entry = url
     ? { url, headers: { Authorization: `!echo Bearer $(cat ${tokenRef})` }, timeout: 120, description: describe(info) }
-    : { command: "ssh", args: ["-T", "-o", "BatchMode=yes", dest, remoteCommand(["stdio", ...(opts.remoteConfig ? ["--config", opts.remoteConfig] : [])])], timeout: 180, description: describe(info) };
+    : { command: "ssh", args: ["-T", "-o", "BatchMode=yes", dest, remoteCommand(["stdio", ...(opts.remoteConfig ? ["--config", opts.remoteConfig] : [])], opts.remoteBin)], timeout: 180, description: describe(info) };
 
   if (opts.print) {
     say(`\npi (~/.pi/agent/mcp.json, under "mcpServers"):\n${JSON.stringify({ [name]: entry }, null, 2)}`);

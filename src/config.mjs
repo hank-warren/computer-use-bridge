@@ -26,7 +26,8 @@ On the machine agents control (macOS: apps and browser tabs; Linux: browser tabs
 
 On the client (where pi, Claude Code or Codex runs):
   connect SSH_HOST  copy the server's token over SSH and add it to pi's mcp.json
-            [--name NAME] [--print] [--pi-config FILE] [--remote-config FILE] [--tunnel-name SSH_HOST]
+            [--name NAME] [--print] [--pi-config FILE] [--remote-config FILE] [--remote-bin PATH]
+            [--tunnel-name SSH_HOST]
 
   version   print the version
 
@@ -35,7 +36,7 @@ setup, status, update, serve and stdio take --config FILE (default ${DEFAULT_CON
 const COMMANDS = ["setup", "status", "update", "serve", "stdio", "connect", "client-info", "version", "help"];
 const FLAGS = {
   setup: { "--apps": "apps", "--allow": "allow", "--engine-for": "engineFor", "--tabs": "tabs", "--host": "host", "--port": "port", "--tunnel": "tunnel" },
-  connect: { "--name": "name", "--pi-config": "piConfig", "--remote-config": "remoteConfig", "--tunnel-name": "tunnelName" },
+  connect: { "--name": "name", "--pi-config": "piConfig", "--remote-config": "remoteConfig", "--tunnel-name": "tunnelName", "--remote-bin": "remoteBin" },
 };
 const SWITCHES = {
   setup: { "--yes": ["yes", true], "-y": ["yes", true], "--no-service": ["service", false], "--no-install": ["install", false] },
