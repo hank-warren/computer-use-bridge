@@ -13,8 +13,8 @@ const cli = src.lastIndexOf("\ntry {\n  const opts = parseArgs");
 if (cli < 0) throw new Error("CLI entry point not found");
 const dir = mkdtempSync(join(tmpdir(), "cub-test-"));
 const file = join(dir, "bridge.mjs");
-writeFileSync(file, src.slice(0, cli) + "\nexport { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema };\n");
-const { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema } = await import(pathToFileURL(file));
+writeFileSync(file, src.slice(0, cli) + "\nexport { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema, adKey, adTree };\n");
+const { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema, adKey, adTree } = await import(pathToFileURL(file));
 rmSync(dir, { recursive: true, force: true });
 
 const assert = (c, m) => { if (!c) { console.log("FAIL", m); process.exitCode = 1; } else console.log("ok  ", m); };
@@ -196,6 +196,91 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   assert(r.map === 1000 / 1280, "screenshot pixels map back to CSS pixels");
   r = await run(2, 0);
   assert(!r.shots[0].clip && r.s.scale === 1 && r.map === 0.5, "max_width 0 keeps full size");
+}
+
+// 4f. The agent-desktop engine: same tools, element numbers mapped to snapshot refs, headless only.
+{
+  const dir = mkdtempSync(join(tmpdir(), "cub-ad-"));
+  const calls = join(dir, "calls.jsonl");
+  const fake = join(dir, "agent-desktop");
+  // A stand-in CLI: records its arguments and answers with canned envelopes.
+  writeFileSync(fake, `#!/usr/bin/env node
+const fs = require("fs");
+const a = process.argv.slice(2);
+const args = a[0] === "--session" ? a.slice(2) : a;
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(a) + "\\n");
+const ok = (data) => { console.log(JSON.stringify({ version: "2.5", ok: true, command: args[0], data })); process.exit(0); };
+const err = (code, message) => { console.log(JSON.stringify({ version: "2.5", ok: false, command: args[0], error: { code, message } })); process.exit(1); };
+switch (args[0]) {
+  case "version": ok({ version: "9.9.9" });
+  case "list-apps": ok({ apps: [{ name: "Discord", pid: 1, bundle_id: "com.hnc.Discord", presentation: "foreground" }, { name: "Terminal", pid: 2, bundle_id: "com.apple.Terminal", presentation: "foreground" }, { name: "Helper", pid: 3, bundle_id: "x.helper" }] });
+  case "snapshot": ok({ app: "Discord", window: { title: "general" }, snapshot_id: "s1", complete: true, tree: { role: "window", name: "general", children: [
+    { role: "statictext", name: "hello\\nthere" },
+    { ref_id: "@s1:e1", role: "button", name: "Send", states: ["enabled"], available_actions: ["Click"] },
+    { ref_id: "@s1:e2", role: "textfield", name: "Message", value: "hi", states: ["focused"], available_actions: ["Click", "Focus"] },
+    { ref_id: "@s1:e3", role: "disclosure", name: "Channels", available_actions: ["Expand"], children_count: 4 } ] } });
+  case "screenshot": ok({ data: "iVBOR", format: "png", width: 10, height: 10 });
+  case "click": if (args[1] === "@s1:e3") err("STALE_REF", "ref no longer matches"); ok({ disposition: { delivery: "delivered_verified", retry: "unsafe" } });
+  default: ok({ disposition: { delivery: "delivered_unverified" } });
+}
+`, { mode: 0o755 });
+  const read = () => readFileSync(calls, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)).map((a) => a[0] === "--session" ? a.slice(2) : a);
+  const clear = () => writeFileSync(calls, "");
+  try {
+    const cfg = { ...config(["com.hnc.Discord"]), appEngine: "agent-desktop", adCommand: fake };
+    const s = new Session(cfg, "t");
+    assert(/agent-desktop, which acts through accessibility/.test(s.instructions()), "instructions describe the agent-desktop engine");
+    const apps = JSON.parse(text(await s.callTool("list_apps", {})));
+    assert(apps.length === 1 && apps[0].id === "com.hnc.Discord" && apps[0].isRunning, "list_apps keeps to the allowlist and skips helpers");
+    const t = text(await s.callTool("get_state", { app: "Discord" }));
+    assert(t.includes("0 button Send") && t.includes("1 textfield (focused) Message, Value: hi, Secondary Actions: Focus"), "refs become element numbers");
+    assert(t.includes("statictext hello ⏎ there") && t.includes("[4 children not shown]") && t.endsWith("The focused UI element is 1."), "text, cut branches and the focus line");
+    assert(read().some((a) => a[0] === "snapshot" && a.includes("--app") && a[a.indexOf("--app") + 1] === "Discord"), "apps are addressed by their display name");
+    clear();
+    const c = text(await s.callTool("click", { app: "com.hnc.Discord", element: 0 }));
+    assert(read()[0].join(" ") === "click @s1:e1" && c.startsWith("click: delivered_verified\nApp: Discord"), "click acts on the ref and returns a fresh tree");
+    clear();
+    await s.callTool("click", { app: "com.hnc.Discord", element: 1, button: "right" });
+    await s.callTool("type_text", { app: "com.hnc.Discord", text: "yo" });
+    await s.callTool("press_key", { app: "com.hnc.Discord", key: "super+Return" });
+    await s.callTool("set_value", { app: "com.hnc.Discord", element: 1, value: "v" });
+    await s.callTool("scroll", { app: "com.hnc.Discord", element: 2, direction: "down", pages: 2 });
+    await s.callTool("secondary_action", { app: "com.hnc.Discord", element: 2, action: "Expand" });
+    const acts = read().filter((a) => a[0] !== "snapshot").map((a) => a.join(" "));
+    assert(acts[0] === "right-click @s1:e2" && acts[1] === "type @s1:e2 yo" && acts[2] === "press cmd+return --app Discord", "right-click, type into the focused element, keys to the app");
+    assert(acts[3] === "set-value @s1:e2 v" && acts[4] === "scroll @s1:e3 --direction down --amount 6" && acts[5] === "expand @s1:e3", "set-value, scroll and secondary actions");
+    clear();
+    for (const [args, re] of [[{ x: 5, y: 5 }, /elements only/], [{ element: 0, count: 2 }, /double-click/]]) {
+      const r = await s.callTool("click", { app: "com.hnc.Discord", ...args });
+      assert(r.isError && re.test(text(r)), `physical input refused: ${re}`);
+    }
+    const dr = await s.callTool("drag", { app: "com.hnc.Discord", from_x: 1, from_y: 1, to_x: 2, to_y: 2 });
+    const sa = await s.callTool("secondary_action", { app: "com.hnc.Discord", element: 0, action: "Raise" });
+    assert(dr.isError && sa.isError && /supports these/.test(text(sa)) && !read().length, "drag and unknown secondary actions refused before the CLI runs");
+    const stale = await s.callTool("click", { app: "com.hnc.Discord", element: 2 });
+    assert(stale.isError && /^STALE_REF: ref no longer matches/.test(text(stale)), "CLI errors come back as tool errors");
+    const gone = await s.callTool("click", { app: "com.hnc.Discord", element: 9 });
+    assert(gone.isError && /not in the latest tree/.test(text(gone)), "unknown element numbers are refused");
+    const term = await s.callTool("get_state", { app: "Terminal" });
+    assert(term.isError && /not allowed/.test(text(term)), "the allowlist still applies");
+    clear();
+    const b = await s.callTool("batch", { app: "com.hnc.Discord", actions: [{ action: "click", element: 0 }, { action: "press_key", key: "Tab" }, { action: "click", element: 0 }] });
+    const bs = read().map((a) => a[0]);
+    assert(!b.isError && bs.join(",") === "click,press,click,snapshot", "a batch reads the tree once, after its last step");
+    clear();
+    const shot = await s.callTool("screenshot", { app: "com.hnc.Discord" });
+    assert(shot.content[0].type === "image" && read().map((a) => a[0]).join() === "screenshot", "screenshot without a tree");
+    clear();
+    const gs = await s.callTool("get_state", { app: "com.hnc.Discord", screenshot: true });
+    const plain = await s.callTool("get_state", { app: "com.hnc.Discord" });
+    assert(gs.content.some((x) => x.type === "image") && !plain.content.some((x) => x.type === "image") && read().filter((a) => a[0] === "screenshot").length === 1, "screenshots only when asked for");
+    assert(adKey("ctrl+shift+Tab") === "ctrl+shift+tab" && adKey("BackSpace") === "delete" && adKey("KP_5") === "5" && adKey("F5") === "f5" && adKey("A") === "A", "xdotool keys map to agent-desktop's");
+    await s.close();
+    assert(read().some((a) => a.join(" ").startsWith("session end cub-")), "the agent-desktop session ends with the bridge session");
+    assert(adTree({ app: "X", complete: false, tree: { role: "window" } }).text.includes("Partial tree"), "partial trees are flagged");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // 5. The tab tree: numbering, flattening and element mapping.
