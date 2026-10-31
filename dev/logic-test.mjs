@@ -1,21 +1,14 @@
 #!/usr/bin/env node
 // Engine-free tests: tool definitions, result shaping, the tab tree, key mapping, and the
-// rules that keep agents to allowed apps and their own tabs. Loads computer-use-bridge.mjs
-// without its CLI entry point and replaces open-computer-use and open-browser-use with fakes.
+// rules that keep agents to allowed apps and their own tabs. Imports the modules and replaces
+// open-computer-use and open-browser-use with fakes.
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-
-const src = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../computer-use-bridge.mjs"), "utf8");
-const cli = src.lastIndexOf("\ntry {\n  const opts = parseArgs");
-if (cli < 0) throw new Error("CLI entry point not found");
-const dir = mkdtempSync(join(tmpdir(), "cub-test-"));
-const file = join(dir, "bridge.mjs");
-writeFileSync(file, src.slice(0, cli) + "\nexport { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema };\n");
-const { Session, ObuBrowser, cdpKey, pwKey, toolDefs, toolSchema } = await import(pathToFileURL(file));
-rmSync(dir, { recursive: true, force: true });
+import { join } from "node:path";
+import { Session } from "../src/session.mjs";
+import { ObuBrowser, cdpKey, pwKey } from "../src/engines/open-browser-use.mjs";
+import { toolDefs, toolSchema } from "../src/tools.mjs";
 
 const assert = (c, m) => { if (!c) { console.log("FAIL", m); process.exitCode = 1; } else console.log("ok  ", m); };
 const text = (r) => r.content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
