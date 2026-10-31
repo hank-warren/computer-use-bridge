@@ -8,41 +8,63 @@ export const BROWSER_IDS = { brave: "com.brave.Browser", chrome: "com.google.Chr
 
 // ---------- configuration ----------
 
-export const USAGE = `usage: ${NAME} <command>
+export const USAGE = `usage: ${NAME} <command> [options]
 
-  setup    configure the HTTP server for this Mac and start it (interactive)
-           [--host IP|tailscale|localhost] [--tunnel HOST[:PORT],...] [--port N] [--allow ID,ID]
-           [--yes] [--no-service]
-  status   check the engine, the config and the running server
-  update   upgrade through Homebrew and restart the service
-  serve    run the HTTP server (what the Homebrew service runs)
-  stdio    speak MCP on stdin/stdout, e.g. over SSH [--approve-all]
-  version  print the version
+On the machine agents control (macOS: apps and browser tabs; Linux: browser tabs):
+  setup     install the engines, write the config, install and start the service (asks;
+            --yes takes defaults). Options:
+              --apps open-computer-use|agent-desktop|off   engine for apps (macOS)
+              --allow ID,ID                 bundle IDs agents may control
+              --engine-for ID=ENGINE,...    per-app engine override
+              --tabs brave|chrome|off       browser for open-browser-use tabs
+              --host IP|tailscale|localhost  --port N  --tunnel SSH_HOST[:PORT],...
+              --yes  --no-service  --no-install
+  status    check engines, permissions, extension, service and server [--json]
+  update    npm i -g ${NAME}@latest, then refresh engines and the service
+  serve     run the HTTP server (what the service runs)
+  stdio     speak MCP on stdin/stdout, e.g. over SSH [--approve-all]
 
-All commands take --config FILE (default ${DEFAULT_CONFIG}).`;
+On the client (where pi, Claude Code or Codex runs):
+  connect SSH_HOST  copy the server's token over SSH and add it to pi's mcp.json
+            [--name NAME] [--print] [--pi-config FILE] [--remote-config FILE] [--tunnel-name SSH_HOST]
+
+  version   print the version
+
+setup, status, update, serve and stdio take --config FILE (default ${DEFAULT_CONFIG}).`;
+
+const COMMANDS = ["setup", "status", "update", "serve", "stdio", "connect", "client-info", "version", "help"];
+const FLAGS = {
+  setup: { "--apps": "apps", "--allow": "allow", "--engine-for": "engineFor", "--tabs": "tabs", "--host": "host", "--port": "port", "--tunnel": "tunnel" },
+  connect: { "--name": "name", "--pi-config": "piConfig", "--remote-config": "remoteConfig", "--tunnel-name": "tunnelName" },
+};
+const SWITCHES = {
+  setup: { "--yes": ["yes", true], "-y": ["yes", true], "--no-service": ["service", false], "--no-install": ["install", false] },
+  update: { "--no-service": ["service", false] },
+  status: { "--json": ["json", true] },
+  stdio: { "--approve-all": ["approveAll", true] },
+  connect: { "--print": ["print", true] },
+  "client-info": { "--with-token": ["withToken", true] },
+};
 
 export function parseArgs(argv) {
   let [mode, ...rest] = argv;
   if (mode === "--version" || mode === "-v") mode = "version";
   if (mode === "--help" || mode === "-h" || mode === undefined) mode = "help";
-  const opts = { mode, approveAll: false, config: DEFAULT_CONFIG, yes: false, service: true };
+  if (!COMMANDS.includes(mode)) throw new Error(`unknown command: ${mode}\n\n${USAGE}`);
+  const opts = { mode, approveAll: false, config: DEFAULT_CONFIG, yes: false, service: true, install: true };
   const value = (i) => {
-    if (rest[i + 1] === undefined) throw new Error(`${rest[i]} needs a value`);
+    if (rest[i + 1] === undefined || rest[i + 1].startsWith("--")) throw new Error(`${rest[i]} needs a value`);
     return rest[i + 1];
   };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
-    if (a === "--approve-all" && mode === "stdio") opts.approveAll = true;
-    else if (a === "--config") opts.config = value(i++);
-    else if (mode === "setup" && a === "--host") opts.host = value(i++);
-    else if (mode === "setup" && a === "--tunnel") opts.tunnel = value(i++);
-    else if (mode === "setup" && a === "--port") opts.port = value(i++);
-    else if (mode === "setup" && a === "--allow") opts.allow = value(i++);
-    else if (mode === "setup" && (a === "--yes" || a === "-y")) opts.yes = true;
-    else if (mode === "setup" && a === "--no-service") opts.service = false;
-    else throw new Error(`unknown argument: ${a}\n\n${USAGE}`);
+    const [flag, inline] = a.startsWith("--") && a.includes("=") ? [a.slice(0, a.indexOf("=")), a.slice(a.indexOf("=") + 1)] : [a, undefined];
+    const key = flag === "--config" && mode !== "connect" ? "config" : FLAGS[mode]?.[flag];
+    if (key) opts[key] = inline ?? value(i++);
+    else if (SWITCHES[mode]?.[flag] && inline === undefined) opts[SWITCHES[mode][flag][0]] = SWITCHES[mode][flag][1];
+    else if (mode === "connect" && !a.startsWith("-") && opts.host === undefined) opts.host = a;
+    else throw new Error(`unknown argument for ${mode}: ${a}\n\n${USAGE}`);
   }
-  if (!["stdio", "serve", "setup", "status", "update", "version", "help"].includes(mode)) throw new Error(`unknown command: ${mode}\n\n${USAGE}`);
   return opts;
 }
 

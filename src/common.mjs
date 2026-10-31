@@ -9,14 +9,10 @@ export const NAME = "computer-use-bridge";
 export const CONFIG_DIR = join(homedir(), ".config", NAME);
 export const DEFAULT_CONFIG = join(CONFIG_DIR, "config.json");
 export const DEFAULT_PORT = 47800;
-// Browsers open-browser-use runs in (Brave reads Chrome's native-messaging folder); tab tools
-// need one of them allowed.
-export const BROWSERS = ["com.brave.Browser", "com.google.Chrome"];
-// open-computer-use drives apps on macOS only; elsewhere (Linux) the bridge serves browser tabs alone.
+// App engines drive macOS apps only; elsewhere (Linux) the bridge serves browser tabs alone.
 export const APPS_SUPPORTED = process.platform === "darwin";
-export const TABS_ONLY_HINT = `this system has no app control, only browser tabs: add ${BROWSERS[0]} (or ${BROWSERS[1]}) to allowApps to turn them on`;
 
-// Never controllable, even if listed in allowApps:
+// Never controllable, even if listed in apps.allow:
 // shells, script runners, credential stores, system settings and mail/messages.
 export const HARD_DENY = new Set([
   "com.apple.Terminal", "com.googlecode.iterm2", "com.mitchellh.ghostty",

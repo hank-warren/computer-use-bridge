@@ -7,7 +7,10 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session } from "../src/session.mjs";
-import { migrateConfig, normalizeConfig } from "../src/config.mjs";
+import { migrateConfig, normalizeConfig, parseArgs } from "../src/config.mjs";
+import { plist, stableNode, unit, versionedNode } from "../src/service.mjs";
+import { remoteCommand } from "../src/connect.mjs";
+import { execFileSync } from "node:child_process";
 import { adKey, adTree } from "../src/engines/agent-desktop.mjs";
 import { ObuBrowser, cdpKey, pwKey } from "../src/engines/open-browser-use.mjs";
 import { toolDefs, toolSchema } from "../src/tools.mjs";
@@ -309,6 +312,28 @@ switch (args[0]) {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// 4h. CLI arguments, service files and the remote command connect runs.
+{
+  const o = parseArgs(["setup", "--apps", "agent-desktop", "--allow=com.hnc.Discord", "--engine-for", "a.b=open-computer-use", "--tabs", "chrome", "--yes", "--no-install"]);
+  assert(o.apps === "agent-desktop" && o.allow === "com.hnc.Discord" && o.engineFor === "a.b=open-computer-use" && o.tabs === "chrome" && o.yes && o.install === false && o.service, "setup flags, with = or a separate value");
+  const c = parseArgs(["connect", "pikachu", "--name", "mac", "--print"]);
+  assert(c.host === "pikachu" && c.name === "mac" && c.print, "connect takes a host and options");
+  let threw = 0;
+  for (const bad of [["setup", "--json"], ["status", "--apps", "x"], ["setup", "--apps"], ["bogus"], ["connect", "a", "b"]]) { try { parseArgs(bad); } catch { threw++; } }
+  assert(threw === 5, "unknown, misplaced and valueless arguments are refused");
+  assert(parseArgs(["status", "--json"]).json && parseArgs(["stdio", "--approve-all"]).approveAll, "status --json and stdio --approve-all");
+  const p = plist("/opt/homebrew/opt/node/bin/node", "/x/bin/computer-use-bridge.mjs", "/u/a&b/config.json", ["/u/.npm-global/bin"]);
+  assert(p.includes("<string>/opt/homebrew/opt/node/bin/node</string>") && p.includes("<string>/u/a&amp;b/config.json</string>") && p.includes("<string>serve</string>") && /<key>PATH<\/key>\s*<string>\/opt\/homebrew\/opt\/node\/bin:\/u\/.npm-global\/bin:/.test(p), "the LaunchAgent runs node with the script, escaped, with node and npm's bin on PATH");
+  const u = unit("/home/u/.nvm/versions/node/v24.1.0/bin/node", "/home/u/my app/bin/computer-use-bridge.mjs", "/home/u/.config/computer-use-bridge/config.json");
+  assert(u.includes('ExecStart=/home/u/.nvm/versions/node/v24.1.0/bin/node "/home/u/my app/bin/computer-use-bridge.mjs" serve --config') && u.includes("Restart=always") && u.includes("WantedBy=default.target"), "the systemd unit quotes paths with spaces");
+  assert(versionedNode("/home/u/.nvm/versions/node/v24.1.0/bin/node") && !versionedNode("/usr/bin/node"), "versioned node paths are recognized");
+  assert(stableNode("/usr/bin/node") === "/usr/bin/node" && stableNode("/nowhere/Cellar/node/26.1.0/bin/node") === "/nowhere/Cellar/node/26.1.0/bin/node", "stableNode keeps paths without an opt link");
+  // The remote command must parse in POSIX sh and find nothing gracefully.
+  let out = "";
+  try { execFileSync("/bin/sh", ["-c", remoteCommand(["client-info", "--config", "/tmp/it's here.json"])], { env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent" }, stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { out = String(e.stderr); }
+  assert(/is not installed there/.test(out), "the remote command runs in sh and reports a missing install");
 }
 
 // 5. The tab tree: numbering, flattening and element mapping.

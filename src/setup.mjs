@@ -1,15 +1,19 @@
 import { spawn } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createInterface as createPrompt } from "node:readline/promises";
-import { APPS_SUPPORTED, BROWSERS, CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, TABS_ONLY_HINT, VERSION, expand, lastLine, readJson, run, say, writePrivate } from "./common.mjs";
-import { checkTunnel, loadConfig } from "./config.mjs";
-import { findOcu } from "./engines/open-computer-use.mjs";
-import { ObuBrowser } from "./engines/open-browser-use.mjs";
+import { CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, VERSION, expand, lastLine, readJson, run, say, sleep, writePrivate } from "./common.mjs";
+import { APP_ENGINES, BROWSER_IDS, checkTunnel, migrateConfig, normalizeConfig } from "./config.mjs";
+import { ENGINES, adPermissions, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
+import { binScript, brewServiceInstalled, installService, linger, logHint, serviceCommand, serviceState, stopBrewService } from "./service.mjs";
 
-// ---------- setup and status ----------
+// ---------- setup, status and update ----------
+
+const MAC = process.platform === "darwin";
+const OS = MAC ? "Mac" : "machine";
 
 export const LEGACY = {
   dir: join(homedir(), ".config/codex-cu-bridge"),
@@ -30,7 +34,8 @@ export const inRange = (ip, [base, bits]) => {
 
 // Tailscale's IPv4 from its CLI. Not guessed from interfaces: other VPNs (e.g. WARP) use the same range.
 export async function tailscaleIp() {
-  for (const cli of ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale"]) {
+  const clis = ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale", "/usr/local/bin/tailscale", "/usr/bin/tailscale", "/usr/sbin/tailscale"];
+  for (const cli of clis) {
     if (!existsSync(cli)) continue;
     const r = await run(cli, ["ip", "-4"], 5000);
     const ip = r.stdout.trim().split("\n")[0];
@@ -39,11 +44,11 @@ export async function tailscaleIp() {
   return null;
 }
 
-// Private addresses on physical interfaces; VPN tunnels (utun, ipsec, ppp) are skipped.
+// Private addresses on physical interfaces; VPN tunnels are skipped.
 export function lanIps() {
   const out = [];
   for (const [name, addrs] of Object.entries(networkInterfaces())) {
-    if (/^(utun|ipsec|ppp|gif|stf)/.test(name)) continue;
+    if (/^(utun|ipsec|ppp|gif|stf|tailscale|wg|tun|docker|br-|veth|virbr)/.test(name)) continue;
     for (const a of addrs ?? []) {
       if (a.family !== "IPv4" || a.internal) continue;
       if ([["10.0.0.0", 8], ["172.16.0.0", 12], ["192.168.0.0", 16]].some((r) => inRange(a.address, r))) out.push({ ip: a.address, name });
@@ -53,6 +58,7 @@ export function lanIps() {
 }
 
 export async function installedApps() {
+  if (!MAC) return [];
   const found = [];
   for (const [id, label] of KNOWN_APPS) {
     const r = await run("/usr/bin/mdfind", [`kMDItemCFBundleIdentifier == '${id}'`], 5000);
@@ -61,12 +67,11 @@ export async function installedApps() {
   return found;
 }
 
-export function brewPath() {
-  for (const p of [process.env.HOMEBREW_PREFIX && join(process.env.HOMEBREW_PREFIX, "bin/brew"), "/opt/homebrew/bin/brew", "/usr/local/bin/brew"]) {
-    if (p && existsSync(p)) return p;
-  }
-  return null;
-}
+const installedBrowser = () => {
+  if (MAC) return existsSync("/Applications/Brave Browser.app") ? "brave" : existsSync("/Applications/Google Chrome.app") ? "chrome" : null;
+  const onPath = (c) => (process.env.PATH ?? "").split(":").some((d) => existsSync(join(d, c)));
+  return onPath("brave") || onPath("brave-browser") ? "brave" : onPath("google-chrome") || onPath("google-chrome-stable") ? "chrome" : null;
+};
 
 export async function health(host, port, waitMs = 0, tokenFile) {
   const until = Date.now() + waitMs;
@@ -78,100 +83,63 @@ export async function health(host, port, waitMs = 0, tokenFile) {
       if (r.ok) return await r.json();
     } catch {}
     if (Date.now() >= until) return null;
-    await new Promise((r) => setTimeout(r, 1000));
+    await sleep(1000);
   }
 }
 
-// Where browsers look for open-browser-use's native host. On macOS Brave reads Chrome's folder; on Linux each has its own.
-export const OBU_HOST = "NativeMessagingHosts/com.ifuryst.open_browser_use.extension.json";
-export const OBU_MANIFESTS = APPS_SUPPORTED
-  ? [join(homedir(), "Library/Application Support/Google/Chrome", OBU_HOST)]
-  : [join(homedir(), ".config/BraveSoftware/Brave-Browser", OBU_HOST), join(homedir(), ".config/google-chrome", OBU_HOST)];
-export const OBU_MANIFEST_FIX = APPS_SUPPORTED
-  ? "npm i -g open-browser-use && open-browser-use install-manifest --browser chrome (also for Brave, which reads Chrome's folder)"
-  : `npm i -g open-browser-use && open-browser-use install-manifest --output ~/${OBU_MANIFESTS[0].slice(homedir().length + 1)} (Brave; Chrome uses ~/.config/google-chrome)`;
-export const OBU_STORE = "https://chromewebstore.google.com/detail/open-browser-use/bgjoihaepiejlfjinojjfgokghnodnhd";
+export const hostName = () => hostname().split(".")[0].toLowerCase();
 
-// What the bridge needs on this Mac: [{ ok, what, fix }].
-export async function prerequisites(cfg) {
+// What this machine needs for the config: [{ ok, warn?, human?, what, fix? }]. human marks steps
+// only a person at the machine can do (permission prompts, the browser extension).
+export async function checks(cfg) {
   const out = [];
-  const add = (ok, what, fix) => out.push({ ok, what, fix });
-  const ocu = findOcu(cfg);
-  if (!APPS_SUPPORTED) {
-    add(true, `apps: off (open-computer-use runs on macOS only; ${process.platform} gets browser tabs)`);
-  } else if (!existsSync(ocu)) {
-    add(false, "open-computer-use is not installed", "npm i -g open-computer-use, then run open-computer-use once and grant it Accessibility and Screen Recording");
-  } else {
-    const r = await run(ocu, ["doctor"], 30_000);
-    const m = /accessibility=(\w+), screenRecording=(\w+)/.exec(r.stdout + r.stderr);
-    if (!m) add(false, `open-computer-use doctor failed: ${lastLine(r.stderr || r.stdout) || `exit ${r.code}`}`, "reinstall it with npm i -g open-computer-use");
-    else {
-      add(m[1] === "granted" && m[2] === "granted", `open-computer-use (${ocu}): Accessibility ${m[1]}, Screen Recording ${m[2]}`,
-        "run open-computer-use and grant both to Open Computer Use in System Settings > Privacy & Security");
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  out.push(nodeMajor >= 20 ? { ok: true, what: `Node ${process.versions.node} (${process.execPath})` } : { ok: false, what: `Node ${process.versions.node} is too old`, fix: "install Node 20 or later" });
+  for (const name of cfg.appEngines ?? []) {
+    const c = engineCheck(name, cfg);
+    out.push(c);
+    if (!installedVersion(name, cfg)) continue;
+    out.push(name === "agent-desktop" ? await adPermissions(cfg) : await ocuPermissions(cfg));
+  }
+  if (cfg.appsOn === false) out.push({ ok: true, what: MAC ? "apps: off" : `apps: off (app control needs macOS; ${process.platform} serves browser tabs)` });
+  if (cfg.tabsOn) {
+    const c = engineCheck("open-browser-use", cfg);
+    out.push(c);
+    if (installedVersion("open-browser-use", cfg)) {
+      out.push(obuManifestCheck(cfg.tabs.browser));
+      out.push(await extensionCheck(cfg));
     }
-  }
-  const allowed = new Set((cfg.allowApps ?? []).map((id) => id.toLowerCase()));
-  if (!BROWSERS.some((id) => allowed.has(id.toLowerCase()))) {
-    if (APPS_SUPPORTED) add(true, `browser tabs: off (allow ${BROWSERS.join(" or ")} to use them)`);
-    else add(false, "browser tabs: off, so there is nothing to serve", TABS_ONLY_HINT);
-    return out;
-  }
-  const manifest = OBU_MANIFESTS.find((f) => existsSync(f));
-  add(!!manifest, `open-browser-use native host ${manifest ? `registered (${manifest})` : "is not registered"}`, OBU_MANIFEST_FIX);
-  const b = new ObuBrowser(cfg, "check");
-  try {
-    const tabs = await b.userTabs();
-    if (b.scanned) out.push({ ok: true, warn: true, what: `open-browser-use extension connected (${tabs.length} tabs) by socket scan: ${b.scanned}`, fix: "optional: disable and re-enable the extension so its native host rewrites active.json" });
-    else add(true, `open-browser-use extension connected (${tabs.length} tabs)`);
-  } catch (e) {
-    add(false, `open-browser-use extension is not connected: ${e.message}`, `install the Open Browser Use extension in your browser (${OBU_STORE}), then quit and reopen the browser`);
-  } finally {
-    await b.close();
-  }
+  } else out.push({ ok: true, what: "browser tabs: off" });
   return out;
 }
 
-export const macName = () => hostname().split(".")[0].toLowerCase();
-
-export const clientConfigs = (mac, url, tokenPath) => `   pi (~/.pi/agent/mcp.json, under "mcpServers"):
-     "${mac}-cu": {
-       "url": "${url}",
-       "headers": { "Authorization": "!echo Bearer $(cat ${tokenPath})" },
-       "timeout": 120
-     }
-
-   Claude Code:
-     claude mcp add --transport http ${mac}-cu ${url} --header "Authorization: Bearer $(cat ${tokenPath})"`;
-
-export function clientHelp(cfg) {
-  const mac = macName();
-  const tokenName = `${mac}.token`;
-  if (cfg.tunnels?.length) {
-    for (const t of cfg.tunnels) {
-      say(`
-On ${t.ssh}, connect clients to http://127.0.0.1:${t.remotePort}/mcp (through the tunnel)
-
-1. The token goes in ~/.config/${NAME}/${tokenName} there. To copy it again from this Mac:
-     ssh ${t.ssh} 'umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${tokenName}' < ${cfg.tokenFile}
-
-2. Client configuration on ${t.ssh}:
-${clientConfigs(mac, `http://127.0.0.1:${t.remotePort}/mcp`, `~/.config/${NAME}/${tokenName}`)}`);
-    }
-    return;
+const mark = (c) => (c.ok && !c.warn ? "ok  " : c.ok ? "warn" : "FAIL");
+const printChecks = (list) => {
+  for (const c of list) {
+    say(`${mark(c)}  ${c.what}`);
+    if ((!c.ok || c.warn) && c.fix) say(`      fix: ${c.fix}`);
   }
-  const url = `http://${cfg.host}:${cfg.port}/mcp`;
+};
+
+export function clientHelp(cfg, file) {
+  const name = hostName();
+  const urls = cfg.tunnels?.length
+    ? cfg.tunnels.map((t) => `http://127.0.0.1:${t.remotePort}/mcp on ${t.ssh} (through the tunnel)`)
+    : [`http://${cfg.host}:${cfg.port}/mcp`];
   say(`
-Connect a client to ${url}
-
-1. Copy the token to the client without printing it, e.g. from the client:
-     ssh ${mac} 'cat ${cfg.tokenFile}' | (umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${tokenName})
-
-2. Client configuration:
-${clientConfigs(mac, url, `~/.config/${NAME}/${tokenName}`)}
-
-   Over SSH instead of HTTP (stdio):
-     ssh -T ${mac} ${brewPath() ? join(dirname(brewPath()), NAME) : NAME} stdio`);
+Connect an agent: on the client machine (with ${NAME} installed there too), run
+  ${NAME} connect ${name}${file !== DEFAULT_CONFIG ? ` --remote-config ${file}` : ""}
+It copies the token over SSH without printing it and adds "${name}" to pi's ~/.pi/agent/mcp.json
+(--print shows the Claude Code and Codex commands instead).
+Server: ${urls.join("; ")}`);
 }
+
+const parseList = (s) => String(s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+const parseEngineFor = (s) => Object.fromEntries(parseList(s).map((p) => {
+  const [id, engine] = p.split("=");
+  if (!id || !APP_ENGINES.includes(engine)) throw new Error(`--engine-for takes ID=ENGINE pairs with ENGINE ${APP_ENGINES.join(" or ")} (got ${p})`);
+  return [id, engine];
+}));
 
 export async function setup(opts) {
   const file = expand(opts.config);
@@ -192,11 +160,21 @@ export async function setup(opts) {
     const a = await ask(`${q} (${def ? "Y/n" : "y/N"})`, "");
     return a ? /^y/i.test(a) : def;
   };
+  const choose = async (q, choices, def) => {
+    if (!rl) return def;
+    say(`\n${q}`);
+    choices.forEach(([, label], i) => say(`  ${i + 1}) ${label}`));
+    const d = Math.max(0, choices.findIndex(([v]) => v === def)) + 1;
+    const pick = String(await ask("Choose a number", String(d)));
+    const c = choices[Number(pick) - 1];
+    if (!c) throw new Error(`no choice ${pick}`);
+    return c[0];
+  };
   try {
-    if (!APPS_SUPPORTED) throw new Error(`setup is macOS-only; on ${process.platform}, write ${DEFAULT_CONFIG} by hand and run "${NAME} serve" as a service (see the README's Linux section)`);
-    say(`${NAME} ${VERSION} setup\n`);
+    say(`${NAME} ${VERSION} setup on ${hostName()} (${MAC ? "macOS" : process.platform})`);
+    if (Number(process.versions.node.split(".")[0]) < 20) throw new Error(`Node ${process.versions.node} is too old; install Node 20 or later`);
 
-    // Older installs used ~/.config/codex-cu-bridge and their own LaunchAgent.
+    // Older installs: codex-cu-bridge's config and LaunchAgent, and 0.x's Homebrew service.
     if (!existsSync(file) && file === DEFAULT_CONFIG && existsSync(join(LEGACY.dir, "config.json"))) {
       const old = readJson(join(LEGACY.dir, "config.json"));
       const oldToken = expand(old.tokenFile ?? join(LEGACY.dir, "token"));
@@ -207,34 +185,80 @@ export async function setup(opts) {
       writePrivate(file, JSON.stringify(old, null, 2) + "\n");
       say(`Migrated config and token from ${LEGACY.dir} (clients keep working with the same token).`);
     }
-    if (file === DEFAULT_CONFIG && existsSync(LEGACY_PLIST) && await confirm(`Remove the old LaunchAgent ${LEGACY.label}? It would hold the same port`)) {
+    if (MAC && file === DEFAULT_CONFIG && existsSync(LEGACY_PLIST) && await confirm(`Remove the old LaunchAgent ${LEGACY.label}? It would hold the same port`)) {
       await run("/bin/launchctl", ["bootout", `gui/${process.getuid()}/${LEGACY.label}`]);
       rmSync(LEGACY_PLIST, { force: true });
       for (const f of LEGACY.files) rmSync(f, { recursive: true, force: true });
       say("Removed the old LaunchAgent and program files.");
     }
+    let brewLeft = false;
+    if (opts.service && brewServiceInstalled() && await confirm("Stop the Homebrew computer-use-bridge service from 0.x? This install replaces it and needs its port")) {
+      await stopBrewService();
+      brewLeft = true;
+      say("Stopped the Homebrew service.");
+    }
 
-    const cfg = existsSync(file) ? readJson(file) : {};
+    const { cfg, migrated } = migrateConfig(existsSync(file) ? readJson(file) : {});
+    if (migrated) say("Converting the 0.x config: apps and browser tabs are separate settings now.");
 
-    // Where clients connect: an address of this Mac, or a reverse tunnel to machines that cannot reach it.
+    // What to serve: apps (macOS) and browser tabs.
+    let appsEngine = opts.apps ?? cfg.apps?.engine;
+    if (!MAC) {
+      if (opts.apps && opts.apps !== "off") throw new Error(`app control needs macOS; on ${process.platform} use --apps off`);
+      appsEngine = "off";
+    } else if (opts.apps === undefined) {
+      appsEngine = await choose("Which engine controls apps?", [
+        ["open-computer-use", "open-computer-use: accessibility plus background clicks and keys; also drives pixel-only apps such as games"],
+        ["agent-desktop", "agent-desktop (experimental): accessibility only, with references that never hit the wrong element; its launcher needs Accessibility (see the README)"],
+        ["off", "off: browser tabs only"],
+      ], appsEngine ?? "open-computer-use");
+    }
+    if (![...APP_ENGINES, "off"].includes(appsEngine)) throw new Error(`--apps must be ${APP_ENGINES.join(", ")} or off`);
+    let allow = opts.allow !== undefined ? parseList(opts.allow) : cfg.apps?.allow;
+    if (appsEngine !== "off" && (opts.allow === undefined && (interactive || !allow))) {
+      const found = await installedApps();
+      const current = allow ?? found.filter(([id]) => !["com.google.Chrome", "com.microsoft.edgemac"].includes(id)).map(([id]) => id);
+      if (rl) {
+        say("\nApps agents may control (comma-separated bundle IDs). Installed and supported here:");
+        for (const [id, label] of found) say(`  ${id}  ${label}`);
+        say("Find any app's ID with: osascript -e 'id of app \"App Name\"'");
+      }
+      allow = parseList(await ask("Allow", current.join(",")));
+    }
+    allow ??= [];
+    const denied = allow.filter((id) => HARD_DENY.has(id.toLowerCase()));
+    if (denied.length) say(`Ignoring always-denied apps: ${denied.join(", ")}`);
+    allow = allow.filter((id) => !HARD_DENY.has(id.toLowerCase()));
+    const engineFor = opts.engineFor !== undefined ? parseEngineFor(opts.engineFor) : cfg.apps?.engineFor ?? {};
+
+    let tabs = opts.tabs ?? (cfg.tabs ? (cfg.tabs.engine === "off" ? "off" : cfg.tabs.browser ?? "brave") : undefined);
+    if (opts.tabs === undefined) {
+      tabs = await choose("Browser tabs through open-browser-use (agents open their own background tabs in your browser)?", [
+        ["brave", "Brave"], ["chrome", "Google Chrome"], ["off", "off"],
+      ], tabs ?? installedBrowser() ?? "brave");
+    }
+    if (![...Object.keys(BROWSER_IDS), "off"].includes(tabs)) throw new Error(`--tabs must be ${Object.keys(BROWSER_IDS).join(", ")} or off`);
+    if (appsEngine === "off" && tabs === "off") throw new Error("apps and tabs are both off, so there would be nothing to serve");
+
+    // Where clients connect: an address of this machine, or a reverse tunnel to machines that cannot reach it.
     const ts = await tailscaleIp();
     const lans = lanIps();
     let host = opts.host;
     let tunnelMode = opts.tunnel !== undefined;
-    if (host === "tailscale") host = ts ?? (() => { throw new Error("Tailscale is not connected on this Mac"); })();
+    if (host === "tailscale") host = ts ?? (() => { throw new Error(`Tailscale is not connected on this ${OS}`); })();
     if (host === "localhost") host = "127.0.0.1";
     if (!host && !tunnelMode) {
       const choices = [];
       if (ts) choices.push({ ip: ts, label: "Tailscale (recommended: only your tailnet can reach it, and traffic is encrypted)" });
       for (const l of lans) choices.push({ ip: l.ip, label: `local network on ${l.name} (plain HTTP: anyone on this network can see traffic and the token)` });
-      choices.push({ ip: "127.0.0.1", label: "this Mac only (local clients)" });
-      choices.push({ tunnel: true, label: "a remote machine over SSH: for a VM you can SSH into but that cannot reach this Mac (e.g. over WARP); this Mac keeps a reverse tunnel open" });
-      if (cfg.host && !cfg.tunnels?.length && !choices.some((c) => c.ip === cfg.host)) choices.unshift({ ip: cfg.host, label: "current config (not an address of this Mac right now)" });
+      choices.push({ ip: "127.0.0.1", label: `this ${OS} only (local clients)` });
+      choices.push({ tunnel: true, label: `a remote machine over SSH: for a VM you can SSH into but that cannot reach this ${OS} (e.g. over WARP); this ${OS} keeps a reverse tunnel open` });
+      if (cfg.host && !cfg.tunnels?.length && !choices.some((c) => c.ip === cfg.host)) choices.unshift({ ip: cfg.host, label: `current config (not an address of this ${OS} right now)` });
+      const def = (cfg.tunnels?.length ? choices.findIndex((c) => c.tunnel) : Math.max(0, choices.findIndex((c) => c.ip === cfg.host))) + 1;
       if (rl) {
         say("\nHow will clients connect?");
         choices.forEach((c, i) => say(`  ${i + 1}) ${c.ip ? `${c.ip}  ` : ""}${c.label}`));
       }
-      const def = (cfg.tunnels?.length ? choices.findIndex((c) => c.tunnel) : Math.max(0, choices.findIndex((c) => c.ip === cfg.host))) + 1;
       const pick = String(await ask("Choose a number or type an IPv4 address", String(def)));
       const choice = /^\d+$/.test(pick) ? choices[Number(pick) - 1] : { ip: pick };
       if (!choice) throw new Error("no such choice");
@@ -252,7 +276,7 @@ export async function setup(opts) {
     if (tunnelMode) {
       const existing = new Map((cfg.tunnels ?? []).map((t) => [t.ssh, t.remotePort]));
       const spec = opts.tunnel ?? await ask("\nSSH host(s) to open the tunnel to, as you would type after ssh (comma-separated)", [...existing.keys()].join(","));
-      for (const part of String(spec ?? "").split(",").map((s) => s.trim()).filter(Boolean)) {
+      for (const part of parseList(spec)) {
         const [ssh, p] = part.split(":");
         let remotePort = p ? Number(p) : existing.get(ssh);
         if (!remotePort) {
@@ -264,20 +288,6 @@ export async function setup(opts) {
       if (!tunnels.length) throw new Error("give at least one SSH host for the tunnel");
     }
 
-    // Which apps clients may control.
-    let allow = opts.allow?.split(",").map((s) => s.trim()).filter(Boolean);
-    if (!allow) {
-      const found = await installedApps();
-      const current = cfg.allowApps ?? found.filter(([id]) => id !== "com.google.Chrome" && id !== "com.microsoft.edgemac").map(([id]) => id);
-      say("\nApps clients may control (comma-separated bundle IDs). Installed and supported here:");
-      for (const [id, label] of found) say(`  ${id}  ${label}`);
-      say("Find any app's ID with: osascript -e 'id of app \"App Name\"'");
-      allow = String(await ask("Allow", current.join(","))).split(",").map((s) => s.trim()).filter(Boolean);
-    }
-    const denied = allow.filter((id) => HARD_DENY.has(id.toLowerCase()));
-    if (denied.length) say(`Ignoring always-denied apps: ${denied.join(", ")}`);
-    allow = allow.filter((id) => !HARD_DENY.has(id.toLowerCase()));
-
     const tokenFile = expand(cfg.tokenFile ?? join(CONFIG_DIR, "token"));
     if (!existsSync(tokenFile) || readFileSync(tokenFile, "utf8").trim().length < 32) {
       writePrivate(tokenFile, randomBytes(32).toString("hex") + "\n");
@@ -286,75 +296,127 @@ export async function setup(opts) {
     chmodSync(tokenFile, 0o600);
 
     for (const t of tunnels) {
-      say(`\nChecking that this Mac can log in to ${t.ssh} without prompts (the service runs in the background)...`);
+      say(`\nChecking that this ${OS} can log in to ${t.ssh} without prompts (the service runs in the background)...`);
       const err = await checkSsh(t.ssh, rl && withTerminal);
       if (err) {
-        say(`Login to ${t.ssh} failed: ${err}\nThe tunnel needs key login without prompts: use an SSH key, and if it has a passphrase, store it in the Keychain (UseKeychain yes and AddKeysToAgent yes in ~/.ssh/config). Then run setup again.`);
+        say(`Login to ${t.ssh} failed: ${err}\nThe tunnel needs key login without prompts: use an SSH key${MAC ? ", and if it has a passphrase, store it in the Keychain (UseKeychain yes and AddKeysToAgent yes in ~/.ssh/config)" : " loaded in an agent the service can reach"}. Then run setup again.`);
         continue;
       }
       say("Login OK.");
-      const mac = macName();
-      if (await confirm(`Copy the token to ${t.ssh} now (~/.config/${NAME}/${mac}.token there)?`)) {
-        const r = await sshWrite(t.ssh, `umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${mac}.token`, readFileSync(tokenFile));
+      if (await confirm(`Copy the token to ${t.ssh} now (~/.config/${NAME}/${hostName()}.token there)?`)) {
+        const r = await sshWrite(t.ssh, `umask 077; mkdir -p ~/.config/${NAME}; cat > ~/.config/${NAME}/${hostName()}.token`, readFileSync(tokenFile));
         say(r ? `Copying failed: ${r}` : "Token copied.");
       }
     }
 
-    Object.assign(cfg, { host, port, tokenFile, allowApps: allow });
-    if (tunnels.length) cfg.tunnels = tunnels;
-    else delete cfg.tunnels;
-    cfg.idleMinutes ??= 30;
-    cfg.maxSessions ??= 4;
-    cfg.engineIdleMinutes ??= 10;
-    delete cfg.engine;
-    // A launchd service has a short PATH, so remember where npm put open-computer-use.
-    if (!cfg.ocuCommand && !existsSync(findOcu(cfg))) {
-      const r = await run(join(dirname(process.execPath), "npm"), ["prefix", "-g"], 15_000);
-      const f = join(r.stdout.trim(), "bin/open-computer-use");
-      if (r.ok && existsSync(f)) cfg.ocuCommand = f;
+    // The config file: 1.0 shape, without 0.x keys.
+    const out = { ...cfg, host, port, tokenFile };
+    out.apps = { engine: appsEngine, allow, ...(Object.keys(engineFor).length ? { engineFor } : {}) };
+    out.tabs = tabs === "off" ? { engine: "off" } : { engine: "open-browser-use", browser: tabs };
+    if (tunnels.length) out.tunnels = tunnels;
+    else delete out.tunnels;
+    for (const k of ["allowApps", "appEngine", "engine", "ocuCommand"]) if (k === "ocuCommand" ? out[k] && !existsSync(expand(out[k])) : true) delete out[k];
+    const norm = normalizeConfig(out, { file });
+
+    // Engines: install what is missing (or a different major version) at the tested version.
+    const needed = [...norm.appEngines, ...(norm.tabsOn ? ["open-browser-use"] : [])];
+    const major = (v) => String(v).split(".")[0];
+    const stale = needed.filter((n) => {
+      const v = installedVersion(n, norm);
+      return !v || (v !== "unknown" && major(v) !== major(ENGINES[n].pin));
+    });
+    if (stale.length && opts.install !== false) {
+      const specs = stale.map((n) => `${n}@${ENGINES[n].pin}`);
+      if (await confirm(`\nInstall ${specs.join(", ")} with npm (${npmPath()})?`)) {
+        say(`$ npm i -g ${specs.join(" ")}`);
+        const err = await npmInstall(specs);
+        say(err ? `npm failed: ${err}` : "Installed.");
+      }
     }
-    writePrivate(file, JSON.stringify(cfg, null, 2) + "\n");
+    if (norm.tabsOn && installedVersion("open-browser-use", norm)) {
+      const err = await registerObuHost(norm, tabs);
+      say(err ? `Registering open-browser-use's native host failed: ${err}` : `Registered open-browser-use's native host for ${tabs === "brave" ? "Brave" : "Chrome"}.`);
+    }
+
+    writePrivate(file, JSON.stringify(out, null, 2) + "\n");
     say(`Wrote ${file}`);
 
-    say("\nChecking open-computer-use and open-browser-use...");
-    for (const c of await prerequisites(cfg)) say(c.ok && !c.warn ? `  ok    ${c.what}` : `  ${c.ok ? "warn" : "FAIL"}  ${c.what}\n        fix: ${c.fix}`);
+    // Steps only a person can do; interactive setup opens them and waits.
+    if (rl && norm.appEngines.includes("open-computer-use") && installedVersion("open-computer-use", norm) && !(await ocuPermissions(norm)).ok) {
+      say("\nopen-computer-use needs Accessibility and Screen Recording. Opening its setup; grant both to Open Computer Use in System Settings...");
+      await ocuOnboard(norm);
+      await waitFor(() => ocuPermissions(norm), "permissions granted", 180);
+    }
+    if (rl && norm.tabsOn && installedVersion("open-browser-use", norm) && !(await extensionCheck(norm)).ok) {
+      const browser = tabs === "brave" ? "Brave" : "Chrome";
+      say(`\nIn ${browser}, add the Open Browser Use extension to the profile agents should use:\n  ${OBU_STORE}\nThen quit and reopen ${browser}.`);
+      if (await confirm("Open that page now?")) openUrl(OBU_STORE, tabs);
+      await waitFor(() => extensionCheck(norm), "extension connected", 300);
+    }
 
-    const brew = brewPath();
-    const managed = brew && (await run(brew, ["list", "--formula", NAME])).ok;
-    if (opts.service && managed) {
-      say("\nStarting the Homebrew service...");
-      const r = await run(brew, ["services", "restart", NAME], 60_000);
-      if (!r.ok) say(r.stderr.trim() || r.stdout.trim());
-    } else if (opts.service) {
-      say(`\nNot installed through Homebrew; run "${NAME} serve" under your own supervisor.`);
-    }
-    const h = opts.service && managed ? await health(host, port, 15_000) : await health(host, port);
-    say(h ? `Listening on http://${host}:${port}/mcp (version ${h.version})` : `Not answering on http://${host}:${port} yet; see "${NAME} status".`);
-    if (h && tunnels.length) {
-      let states = [];
-      for (let i = 0; i < 25; i++) {
-        states = (await health(host, port, 0, tokenFile))?.tunnels ?? [];
-        if (states.length && states.every((s) => s.up)) break;
-        await new Promise((r) => setTimeout(r, 1000));
+    // The service.
+    if (opts.service) {
+      say(`\nInstalling the service (${MAC ? "LaunchAgent" : "systemd user unit"})...`);
+      const npmBin = (await run(npmPath(), ["prefix", "-g"], 15_000)).stdout.trim();
+      const notes = await installService(file, npmBin ? [join(npmBin, "bin")] : []);
+      for (const n of notes) say(`Note: ${n}`);
+      const h = await health(host, port, 15_000);
+      say(h ? `Listening on http://${host}:${port}/mcp (version ${h.version})` : `Not answering on http://${host}:${port} yet; see "${NAME} status" and ${logHint()}`);
+      if (h && tunnels.length) {
+        let states = [];
+        for (let i = 0; i < 25; i++) {
+          states = (await health(host, port, 0, tokenFile))?.tunnels ?? [];
+          if (states.length && states.every((s) => s.up)) break;
+          await sleep(1000);
+        }
+        for (const s of states) say(s.up ? `Tunnel to ${s.ssh} is up: port ${s.remotePort} there reaches this server.` : `Tunnel to ${s.ssh} is not up yet: ${s.error}. It keeps retrying; see "${NAME} status".`);
       }
-      for (const s of states) say(s.up ? `Tunnel to ${s.ssh} is up: port ${s.remotePort} there reaches this server.` : `Tunnel to ${s.ssh} is not up yet: ${s.error}. It keeps retrying; see "${NAME} status".`);
+    } else say(`\nNo service installed (--no-service); run "${NAME} serve --config ${file}" under your own supervisor.`);
+    if (brewLeft) say(`\nThe Homebrew formula is no longer used; remove it with: brew uninstall ${NAME} && brew untap hank-warren/${NAME}`);
+
+    say("\nChecks:");
+    const list = await checks(norm);
+    printChecks(list);
+    const todo = list.filter((c) => !c.ok);
+    if (todo.length) {
+      say(`\nNeeds ${todo.some((c) => c.human) ? "a person at this " + OS : "attention"}:`);
+      for (const c of todo) say(`  - ${c.what}\n    ${c.fix ?? ""}`);
+      say(`Then run "${NAME} status".`);
     }
-    clientHelp(cfg);
+    clientHelp(norm, file);
+    return todo.length ? 3 : 0;
   } finally {
     rl?.close();
   }
 }
 
-export const SSH_CHECK_OPTS = ["-o", "ConnectTimeout=15", "-o", "RemoteCommand=none", "-o", "RequestTTY=no", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
+async function waitFor(check, done, seconds) {
+  say(`Waiting up to ${Math.round(seconds / 60)} min for ${done} (Ctrl-C stops setup; run it again later)...`);
+  const until = Date.now() + seconds * 1000;
+  while (Date.now() < until) {
+    const c = await check();
+    if (c.ok) return say(`  ${c.what}`);
+    await sleep(3000);
+  }
+  say("  Still waiting; continuing. The checks below say what is left.");
+}
+
+function openUrl(url, browser) {
+  const cmd = MAC ? ["/usr/bin/open", ["-a", browser === "chrome" ? "Google Chrome" : "Brave Browser", url]] : ["xdg-open", [url]];
+  try { spawn(...cmd, { stdio: "ignore", detached: true }).on("error", () => {}).unref(); } catch {}
+}
+
+const SSH_CHECK_OPTS = ["-o", "ConnectTimeout=15", "-o", "RemoteCommand=none", "-o", "RequestTTY=no", "-o", "ControlMaster=no", "-o", "ControlPath=none"];
+const SSH = MAC ? "/usr/bin/ssh" : "ssh";
 
 // Checks key login without prompts; if it fails and setup is interactive, connects
 // once interactively first (to accept a new host key or unlock a key).
 export async function checkSsh(dest, withTerminal) {
-  const batch = () => run("/usr/bin/ssh", ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, "true"], 30_000);
+  const batch = () => run(SSH, ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, "true"], 30_000);
   let r = await batch();
   if (!r.ok && withTerminal) {
     say(`Background login failed (${lastLine(r.stderr) || "no error"}). Connecting interactively once, e.g. to accept its host key:`);
-    await withTerminal(() => new Promise((res) => spawn("/usr/bin/ssh", [...SSH_CHECK_OPTS, dest, "true"], { stdio: "inherit" }).on("exit", res)));
+    await withTerminal(() => new Promise((res) => spawn(SSH, [...SSH_CHECK_OPTS, dest, "true"], { stdio: "inherit" }).on("exit", res)));
     r = await batch();
   }
   return r.ok ? null : lastLine(r.stderr) || `ssh exited ${r.code}`;
@@ -363,7 +425,7 @@ export async function checkSsh(dest, withTerminal) {
 // Runs a command over SSH with data on its stdin; returns an error message or null.
 export function sshWrite(dest, command, data) {
   return new Promise((resolve) => {
-    const p = spawn("/usr/bin/ssh", ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, command], { stdio: ["pipe", "ignore", "pipe"] });
+    const p = spawn(SSH, ["-o", "BatchMode=yes", ...SSH_CHECK_OPTS, dest, command], { stdio: ["pipe", "ignore", "pipe"] });
     let err = "";
     p.stderr.on("data", (d) => { err += d; });
     p.on("error", (e) => resolve(e.message));
@@ -372,53 +434,60 @@ export function sshWrite(dest, command, data) {
   });
 }
 
-// brew upgrade does not restart services, so this does both.
-export async function update() {
-  if (!APPS_SUPPORTED) throw new Error(`update is macOS-only; on ${process.platform}, update the checkout (git pull) and restart your service`);
-  const brew = brewPath();
-  if (!brew || !(await run(brew, ["list", "--formula", NAME])).ok) throw new Error(`${NAME} was not installed through Homebrew`);
-  const step = (args) => new Promise((resolve, reject) => {
-    say(`$ brew ${args.join(" ")}`);
-    spawn(brew, args, { stdio: "inherit" }).on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`brew ${args[0]} failed (${code})`))));
-  });
-  await step(["update", "--quiet"]);
-  await step(["upgrade", NAME]);
-  await step(["services", "restart", NAME]);
-  const r = await run(join(dirname(brew), NAME), ["version"]);
-  say(`Now running ${r.stdout.trim()}`);
+// npm i -g computer-use-bridge@latest, then the new version's own setup --yes, which keeps the
+// config, installs its tested engine versions and rewrites and restarts the service.
+export async function update(opts) {
+  const pkg = realpathSync(fileURLToPath(new URL("..", import.meta.url)));
+  const root = (await run(npmPath(), ["root", "-g"], 15_000)).stdout.trim();
+  let global = false;
+  try { global = !!root && pkg.startsWith(realpathSync(root)); } catch {}
+  if (global) {
+    say(`$ npm i -g ${NAME}@latest`);
+    const err = await npmInstall([`${NAME}@latest`]);
+    if (err) throw new Error(`npm failed: ${err}`);
+  } else say(`${pkg} is not an npm global install, so it is not upgraded here (git pull a checkout). Refreshing the engines and service...`);
+  const args = [binScript(), "setup", "--yes", "--config", opts.config, ...(opts.service ? [] : ["--no-service"])];
+  return new Promise((resolve) => spawn(process.execPath, args, { stdio: "inherit" }).on("exit", (code) => resolve(code ?? 1)));
 }
 
 export async function status(opts) {
   const file = expand(opts.config);
-  let bad = false;
-  const line = (ok, s) => { if (!ok) bad = true; say(`${ok ? "ok  " : "FAIL"}  ${s}`); };
-  say(`${NAME} ${VERSION}`);
+  const report = { version: VERSION, host: hostName(), platform: process.platform, config: file, ok: true, checks: [] };
+  const add = (c) => {
+    report.checks.push(c);
+    if (!c.ok) report.ok = false;
+  };
   let cfg = null;
   try {
-    cfg = loadConfig({ ...opts, mode: "serve" });
-    const tokenOk = existsSync(expand(cfg.tokenFile)) && readFileSync(expand(cfg.tokenFile), "utf8").trim().length >= 32;
-    line(true, `config: ${file}`);
-    line(tokenOk, `token: ${cfg.tokenFile}`);
-    say(`      listen http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ") || "(none)"}; engine idle stop: ${cfg.engineIdleMinutes || "off"} min`);
-    for (const t of cfg.tunnels) say(`      tunnel to ${t.ssh}, port ${t.remotePort} there`);
-  } catch (e) { line(false, `config: ${e.message}`); }
-  const brew = brewPath();
-  if (brew) {
-    const r = await run(brew, ["services", "info", NAME, "--json"]);
-    let info = null;
-    try { info = r.ok ? JSON.parse(r.stdout)[0] : null; } catch {}
-    if (info) line(info.running, `service: ${info.running ? `running (pid ${info.pid})` : info.status ?? "not running"}`);
+    const raw = readJson(file);
+    cfg = normalizeConfig(raw, { file });
+    const tokenOk = existsSync(expand(cfg.tokenFile ?? "")) && readFileSync(expand(cfg.tokenFile), "utf8").trim().length >= 32;
+    add({ ok: true, what: `config ${file}${migrateConfig(raw).migrated ? ' (0.x format; run "setup" to convert it)' : ""}` });
+    add(tokenOk ? { ok: true, what: `token ${cfg.tokenFile}` } : { ok: false, what: `token ${cfg.tokenFile ?? "(none)"} is missing or short`, fix: `run "${NAME} setup"` });
+    report.server = { url: `http://${cfg.host}:${cfg.port}/mcp`, apps: cfg.appsOn ? { engines: cfg.appEngines, allow: cfg.allowApps } : "off", tabs: cfg.tabsOn ? cfg.tabs.browser : "off" };
+  } catch (e) {
+    add({ ok: false, what: `config: ${e.message}`, fix: `run "${NAME} setup"` });
   }
-  if (existsSync(LEGACY_PLIST)) line(false, `old LaunchAgent still installed (${LEGACY.label}); run "${NAME} setup" to remove it`);
+  const svc = await serviceState();
+  report.service = svc;
+  add(svc.installed ? { ok: svc.running, what: `service ${svc.detail}`, fix: `see ${logHint()}` } : { ok: false, what: "service not installed", fix: `run "${NAME} setup" (or run "${NAME} serve" yourself)` });
+  const sc = serviceCommand();
+  if (sc?.node && !existsSync(sc.node)) add({ ok: false, what: `the service runs ${sc.node}, which no longer exists (Node was upgraded or switched)`, fix: `run "${NAME} setup --yes" to point it at this Node` });
+  if (sc?.script && !existsSync(sc.script)) add({ ok: false, what: `the service runs ${sc.script}, which no longer exists`, fix: `run "${NAME} setup --yes"` });
+  if (svc.installed && !MAC && !(await linger())) add({ ok: true, warn: true, what: "lingering is off: the service stops at logout and does not start at boot", fix: `sudo loginctl enable-linger ${process.env.USER ?? "$USER"}` });
+  if (brewServiceInstalled()) add({ ok: false, what: "the 0.x Homebrew service is still installed and holds the same port", fix: `run "${NAME} setup", or: brew services stop ${NAME} && brew uninstall ${NAME}` });
+  if (MAC && existsSync(LEGACY_PLIST)) add({ ok: false, what: `old LaunchAgent still installed (${LEGACY.label})`, fix: `run "${NAME} setup" to remove it` });
   if (cfg) {
     const h = await health(cfg.host, cfg.port, 0, cfg.tokenFile);
-    line(!!h, h ? `server: answering, version ${h.version}${h.version !== VERSION ? " (restart the service to run this version)" : ""}` : `server: not answering on ${cfg.host}:${cfg.port}`);
-    for (const t of h?.tunnels ?? []) line(t.up, `tunnel: ${t.ssh} port ${t.remotePort} ${t.up ? "up" : `down: ${t.error}`}`);
+    report.server.answering = !!h;
+    add(h ? { ok: true, warn: h.version !== VERSION, what: `server answering, version ${h.version}`, fix: h.version !== VERSION ? `restart the service to run ${VERSION}` : undefined } : { ok: false, what: `server not answering on ${cfg.host}:${cfg.port}`, fix: `see ${logHint()}` });
+    for (const t of h?.tunnels ?? []) add({ ok: t.up, what: `tunnel to ${t.ssh} port ${t.remotePort} ${t.up ? "up" : `down: ${t.error}`}` });
+    for (const c of await checks(cfg)) add(c);
   }
-  for (const c of await prerequisites(cfg ?? {})) {
-    if (c.warn) say(`warn  ${c.what}`);
-    else line(c.ok, c.what);
-    if (!c.ok || c.warn) say(`      fix: ${c.fix}`);
+  if (opts.json) say(JSON.stringify(report, null, 2));
+  else {
+    say(`${NAME} ${VERSION} on ${report.host}`);
+    printChecks(report.checks);
   }
-  return bad ? 1 : 0;
+  return report.ok ? 0 : 1;
 }
