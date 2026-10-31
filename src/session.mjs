@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { hostname } from "node:os";
-import { APPS_SUPPORTED, BROWSERS, J, log, sleep } from "./common.mjs";
+import { J, log, sleep } from "./common.mjs";
 import { ACTIONS, BadInput, DEFAULT_MAX_WIDTH, DEFAULT_TREE_MAX, TAB_TOOLS, httpUrl, int, num, opt, scaleImage, str, textResult, toolDefs, toolSchema } from "./tools.mjs";
 import { OcuChild } from "./engines/open-computer-use.mjs";
+import { AD_ENGINE, AdEngine } from "./engines/agent-desktop.mjs";
 import { OBU_SESSION, ObuBrowser, pwKey } from "./engines/open-browser-use.mjs";
 
 export const OCU_ACTIONS = Object.keys(ACTIONS);
@@ -12,44 +13,49 @@ export class Session {
   constructor(cfg, label) {
     this.cfg = cfg;
     this.label = label;
-    this.child = null; // open-computer-use, for apps
+    this.engines = new Map(); // app engine name -> running engine (open-computer-use, agent-desktop)
+    this.starting = new Map();
     this.obu = null; // open-browser-use, for tabs
     // Kept for the life of the session, so its tabs survive release and the idle stop.
     const short = randomUUID().slice(0, 8);
     this.obuSession = { id: `${OBU_SESSION}-${short}`, name: `Agent ${short}` };
-    this.starting = null;
     this.appNames = null;
     this.lastUsed = Date.now();
     this.scales = new Map();
     this.busy = 0;
     this.notice = null;
-    this.tabsOn = BROWSERS.some((id) => cfg.isAllowed(id));
-    this.appsOn = cfg.appsOn ?? APPS_SUPPORTED;
+    this.tabsOn = !!cfg.tabsOn;
+    this.appsOn = !!cfg.appsOn;
     this.tools = toolDefs(this.tabsOn, this.appsOn).filter((t) => t.name !== "eval_tab" || cfg.tabEval !== false).map(toolSchema);
     // The engine holds screen capture and tab attachments while it runs, so it is
     // stopped when idle; the MCP session stays open and restarts it on demand.
     const idleMs = cfg.engineIdleMinutes * 60_000;
     if (idleMs > 0) {
       this.reaper = setInterval(() => {
-        if ((this.child || this.obu) && !this.busy && Date.now() - this.lastUsed >= idleMs) this.stopEngine("idle");
+        if ((this.engines.size || this.obu) && !this.busy && Date.now() - this.lastUsed >= idleMs) this.stopEngine("idle");
       }, Math.min(30_000, idleMs)).unref();
     }
   }
 
-  async cua() {
-    if (this.child && !this.child.dead) return this.child;
-    this.starting ??= (async () => {
-      const c = new OcuChild(this.cfg, this.label);
-      await c.start();
-      this.child = c;
-      this.appNames = null;
-      if (this.stopReason) {
-        this.notice = `The computer-use engine was restarted (${this.stopReason}), so element numbers from earlier trees are stale; call get_state before using them.`;
-        this.stopReason = null;
-      }
-      return c;
-    })().finally(() => { this.starting = null; });
-    return this.starting;
+  // The app engine for an app (its apps.engineFor entry, else apps.engine), started on first use.
+  async cua(app) {
+    const name = app === undefined ? this.cfg.appEngine : this.cfg.appEngineFor(app);
+    const running = this.engines.get(name);
+    if (running && !running.dead) return running;
+    if (!this.starting.has(name)) {
+      this.starting.set(name, (async () => {
+        const c = name === AD_ENGINE ? new AdEngine(this.cfg, this.label) : new OcuChild(this.cfg, this.label);
+        await c.start();
+        this.engines.set(name, c);
+        this.appNames = null;
+        if (this.stopReason) {
+          this.notice = `The computer-use engine was restarted (${this.stopReason}), so element numbers from earlier trees are stale; call get_state before using them.`;
+          this.stopReason = null;
+        }
+        return c;
+      })().finally(() => this.starting.delete(name)));
+    }
+    return this.starting.get(name);
   }
 
   browser() {
@@ -59,20 +65,20 @@ export class Session {
 
   // Detaches agent tabs (they stay open) and stops open-computer-use; the next call restarts them.
   async stopEngine(why) {
-    const c = this.child;
+    const engines = [...this.engines.values()];
     const b = this.obu;
-    if (!c && !b) return false;
-    this.child = null;
+    if (!engines.length && !b) return false;
+    this.engines.clear();
     this.obu = null;
     this.stopReason = why;
     log(`[${this.label}] stopping engine (${why})`);
-    await Promise.allSettled([c?.close(), b?.close()]);
+    await Promise.allSettled([...engines.map((c) => c.close()), b?.close()]);
     return true;
   }
 
   close() {
     clearInterval(this.reaper);
-    return Promise.allSettled([this.child?.close(), this.obu?.close()]);
+    return Promise.allSettled([...[...this.engines.values()].map((c) => c.close()), this.obu?.close()]);
   }
 
   listTools() {
@@ -84,8 +90,8 @@ export class Session {
     this.busy++;
     try {
       const res = await this.callFixed(name, args ?? {});
-      if (this.notice && this.child && name !== "get_state") res.content.unshift({ type: "text", text: this.notice });
-      if (this.child) this.notice = null;
+      if (this.notice && this.engines.size && name !== "get_state") res.content.unshift({ type: "text", text: this.notice });
+      if (this.engines.size) this.notice = null;
       return res;
     } catch (e) {
       if (e instanceof BadInput) return textResult(e.message, true);
@@ -123,6 +129,7 @@ export class Session {
     return `Computer use on the Mac "${hostname()}". Allowed apps: ${this.cfg.allowApps.join(", ") || "(none)"}. ` +
       "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
       "Reading an app whose window is minimized or on another Space brings it forward, so prefer apps the user has on screen. " +
+      this.adNote() +
       (this.tabsOn
         ? "For web pages, use tabs: open_tab opens a background tab in your own tab group; pass its tab ID instead of app to get_state, screenshot, batch and the actions; read_tab, eval_tab and tab_locator work on tabs. You can act only on tabs you opened; the user's tabs and other agents' tabs are listed but off limits. "
         : "There are no browser-tab tools. ") +
@@ -131,9 +138,18 @@ export class Session {
       "Ask the user before sending messages, submitting forms, purchasing, or transmitting sensitive data.";
   }
 
+  // What clients need to know about apps that run on agent-desktop.
+  adNote() {
+    if (!this.cfg.appEngines?.includes(AD_ENGINE)) return "";
+    const which = this.cfg.appEngine === AD_ENGINE
+      ? (this.cfg.appEngines.length > 1 ? `Apps run on agent-desktop except ${this.cfg.allowApps.filter((id) => this.cfg.appEngineFor(id) !== AD_ENGINE).join(", ")}` : "Apps run on agent-desktop")
+      : `${this.cfg.allowApps.filter((id) => this.cfg.appEngineFor(id) === AD_ENGINE).join(", ")} run on agent-desktop`;
+    return `${which}, which acts through accessibility only: click (left or right), set_value, scroll and the listed secondary actions take element numbers, type_text types into the tree's focused element, and press_key goes to the app without focusing it. There are no coordinate clicks, double clicks or drags there; screenshots are for looking only. `;
+  }
+
   // [{ id, displayName, isRunning }] from lines like "Discord — com.hnc.Discord [running, ...]".
   async apps() {
-    if (this.appNames && this.child) return this.appNames;
+    if (this.appNames && this.engines.has(this.cfg.appEngine)) return this.appNames;
     const r = await (await this.cua()).call("list_apps", {});
     const text = (r.content ?? []).filter((c) => c.type === "text").map((c) => c.text).join("\n");
     this.appNames = text.split("\n").map((l) => /^(.*) — (\S+) \[(.*)\]$/.exec(l.trim())).filter(Boolean)
@@ -408,7 +424,8 @@ export class Session {
       return this.callTab(name, a, { cap, maxWidth });
     }
     if (!this.appsOn && name !== "release") throw new BadInput("this server has browser tabs only; give tab (from open_tab or list_tabs)");
-    const ocu = async (tool, args, timeoutMs = 60_000) => (await this.cua()).call(tool, args, timeoutMs);
+    // Each call goes to the app's engine. opts are for agent-desktop (image, quiet); open-computer-use ignores them.
+    const ocu = async (tool, args, timeoutMs = 60_000, opts) => (await this.cua(args.app)).call(tool, args, timeoutMs, opts);
     switch (name) {
       case "release":
         return textResult(await this.stopEngine("released")
@@ -427,7 +444,7 @@ export class Session {
       }
       case "get_state": {
         const id = await this.resolveApp(a.app);
-        const r = await ocu("get_app_state", { app: id, ...(cap === 0 ? { max_tree_nodes: 100_000 } : {}) });
+        const r = await ocu("get_app_state", { app: id, ...(cap === 0 ? { max_tree_nodes: 100_000 } : {}) }, 60_000, { image: a.screenshot === true });
         return this.shape(r, id, { cap, maxWidth, image: a.screenshot === true });
       }
       case "screenshot": {
@@ -461,14 +478,14 @@ export class Session {
             last = null;
             continue;
           }
-          last = await ocu(...s.call);
+          last = await ocu(...s.call, 60_000, { quiet: i < steps.length - 1 });
           if (last.isError) {
             const out = await this.shape(last, id, { cap, maxWidth });
             out.content.unshift({ type: "text", text: `Batch stopped at step ${i + 1} (${s.action}).` });
             return out;
           }
         }
-        if (!last || a.screenshot === true) last = await ocu("get_app_state", { app: id });
+        if (!last || a.screenshot === true) last = await ocu("get_app_state", { app: id }, 60_000, { image: a.screenshot === true });
         return this.shape(last, id, { cap, maxWidth, image: a.screenshot === true });
       }
       default: {

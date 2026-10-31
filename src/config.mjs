@@ -1,5 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
-import { APPS_SUPPORTED, BROWSERS, DEFAULT_CONFIG, HARD_DENY, NAME, TABS_ONLY_HINT, expand } from "./common.mjs";
+import { APPS_SUPPORTED, DEFAULT_CONFIG, HARD_DENY, NAME, expand } from "./common.mjs";
+
+export const APP_ENGINES = ["open-computer-use", "agent-desktop"];
+export const TAB_ENGINES = ["open-browser-use"];
+// Browsers open-browser-use runs in, by the name the config uses.
+export const BROWSER_IDS = { brave: "com.brave.Browser", chrome: "com.google.Chrome" };
 
 // ---------- configuration ----------
 
@@ -48,28 +53,68 @@ export function checkTunnel(t) {
   return { ssh: t.ssh, remotePort: t.remotePort };
 }
 
-export function loadConfig(opts) {
-  const file = expand(opts.config);
-  const cfg = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
-  if (opts.mode === "serve") {
-    if (!cfg.host || !cfg.port || !cfg.tokenFile) throw new Error(`${file} needs host, port and tokenFile; run "${NAME} setup"`);
-    if (cfg.approve === "all") throw new Error("serve only supports the allowlist");
-    cfg.tunnels = (cfg.tunnels ?? []).map(checkTunnel);
-    cfg.approve = "allowlist";
-  } else {
-    cfg.approve = opts.approveAll ? "all" : "allowlist";
-  }
-  cfg.allowApps = (cfg.allowApps ?? []).filter((id) => !HARD_DENY.has(id.toLowerCase()));
+// 0.x configs turned tabs on by listing a browser in allowApps; 1.0 has explicit apps and tabs.
+export function migrateConfig(raw, appsSupported = APPS_SUPPORTED) {
+  if (raw.apps !== undefined || raw.tabs !== undefined || raw.allowApps === undefined) return { cfg: raw, migrated: false };
+  const cfg = { ...raw };
+  const allow = cfg.allowApps;
+  const has = (id) => allow.some((x) => x.toLowerCase() === id.toLowerCase());
+  const browser = Object.keys(BROWSER_IDS).find((b) => has(BROWSER_IDS[b]));
+  cfg.apps = appsSupported ? { engine: cfg.appEngine ?? "open-computer-use", allow } : { engine: "off" };
+  cfg.tabs = browser ? { engine: "open-browser-use", browser } : { engine: "off" };
+  delete cfg.allowApps;
+  delete cfg.appEngine;
+  if (cfg.engine === "open-computer-use") delete cfg.engine;
+  return { cfg, migrated: true };
+}
+
+const oneOf = (v, list, what) => {
+  if (!list.includes(v)) throw new Error(`${what} must be ${list.join(" or ")} (got ${JSON.stringify(v)})`);
+  return v;
+};
+
+// Validates a config (either version) and adds the derived fields the server uses:
+// appsOn, tabsOn, allowApps, isAllowed(id), appEngine and appEngineFor(id).
+export function normalizeConfig(raw, { file = "config", approveAll = false, appsSupported = APPS_SUPPORTED } = {}) {
+  const { cfg } = migrateConfig(structuredClone(raw), appsSupported);
+  if (cfg.engine !== undefined) throw new Error(`${file}: "engine" is no longer supported; remove it and set apps.engine`);
+  const apps = { engine: "off", allow: [], engineFor: {}, ...cfg.apps };
+  const tabs = { engine: "off", browser: "brave", ...cfg.tabs };
+  oneOf(apps.engine, [...APP_ENGINES, "off"], "apps.engine");
+  oneOf(tabs.engine, [...TAB_ENGINES, "off"], "tabs.engine");
+  oneOf(tabs.browser, Object.keys(BROWSER_IDS), "tabs.browser");
+  if (!appsSupported && apps.engine !== "off") throw new Error(`${file}: app control needs macOS; set apps.engine to "off" (browser tabs work here)`);
+  if (apps.engine === "off" && tabs.engine === "off") throw new Error(`${file}: apps and tabs are both off, so there is nothing to serve; run "${NAME} setup"`);
+  if (!Array.isArray(apps.allow) || !apps.allow.every((x) => typeof x === "string")) throw new Error(`${file}: apps.allow must be a list of bundle IDs`);
+  for (const [id, e] of Object.entries(apps.engineFor)) oneOf(e, APP_ENGINES, `apps.engineFor["${id}"]`);
+  cfg.apps = apps;
+  cfg.tabs = tabs;
+  cfg.approve = approveAll ? "all" : "allowlist";
+  cfg.appsOn = apps.engine !== "off";
+  cfg.tabsOn = tabs.engine !== "off";
+  cfg.allowApps = cfg.appsOn ? apps.allow.filter((id) => !HARD_DENY.has(id.toLowerCase())) : [];
   const allowed = new Set(cfg.allowApps.map((id) => id.toLowerCase()));
-  cfg.isAllowed = (id) => cfg.approve === "all" || (typeof id === "string" && allowed.has(id.toLowerCase()));
-  cfg.appsOn = APPS_SUPPORTED;
-  if (!cfg.appsOn && !BROWSERS.some(cfg.isAllowed)) throw new Error(`${file}: ${TABS_ONLY_HINT}`);
+  cfg.isAllowed = (id) => cfg.appsOn && (cfg.approve === "all" || (typeof id === "string" && allowed.has(id.toLowerCase())));
+  const engineFor = new Map(Object.entries(apps.engineFor).map(([id, e]) => [id.toLowerCase(), e]));
+  cfg.appEngine = apps.engine;
+  cfg.appEngineFor = (id) => engineFor.get(String(id).toLowerCase()) ?? apps.engine;
+  cfg.appEngines = cfg.appsOn ? [...new Set([apps.engine, ...engineFor.values()])] : [];
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
   cfg.engineIdleMinutes ??= 10;
-  if (cfg.engine !== undefined && cfg.engine !== "open-computer-use") {
-    throw new Error(`engine "${cfg.engine}" is no longer supported: 0.5 runs only on open-computer-use; remove "engine" from ${file}`);
-  }
   if (typeof cfg.engineIdleMinutes !== "number" || !(cfg.engineIdleMinutes >= 0)) throw new Error("engineIdleMinutes must be a number >= 0 (0 disables)");
+  return cfg;
+}
+
+export function loadConfig(opts) {
+  const file = expand(opts.config);
+  if (!existsSync(file)) throw new Error(`no config at ${file}; run "${NAME} setup"`);
+  const raw = JSON.parse(readFileSync(file, "utf8"));
+  if (opts.mode === "serve") {
+    if (!raw.host || !raw.port || !raw.tokenFile) throw new Error(`${file} needs host, port and tokenFile; run "${NAME} setup"`);
+    if (raw.approve === "all") throw new Error("serve only supports the allowlist");
+  }
+  const cfg = normalizeConfig(raw, { file, approveAll: opts.mode === "stdio" && opts.approveAll });
+  cfg.tunnels = (cfg.tunnels ?? []).map(checkTunnel);
   return cfg;
 }

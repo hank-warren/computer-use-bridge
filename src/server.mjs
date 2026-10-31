@@ -198,7 +198,7 @@ export function runHttp(cfg) {
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
   const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
   server.listen(cfg.port, cfg.host, () => {
-    log(`serving on http://${cfg.host}:${cfg.port}/mcp; ${cfg.appsOn ? `apps: ${cfg.allowApps.join(", ")}` : "browser tabs only"}`);
+    log(`serving on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.appsOn ? `${cfg.appEngines.join(" + ")} (${cfg.allowApps.join(", ")})` : "off"}; tabs: ${cfg.tabsOn ? `${cfg.tabs.engine} (${cfg.tabs.browser})` : "off"}`);
     for (const t of tunnels) t.start();
   });
   const stop = async () => {
