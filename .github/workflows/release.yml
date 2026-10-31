@@ -42,6 +42,9 @@ jobs:
 
       - name: Publish to npm
         run: |
+          v="$(node -p 'require("./package.json").version')"
+          # A version published by hand (the first one, before trusted publishing existed) is skipped.
+          if npm view "computer-use-bridge@$v" version >/dev/null 2>&1; then echo "$v is already on npm"; exit 0; fi
           # Trusted publishing needs npm 11.5.1 or later.
           npm i -g npm@^11.5.1
           npm publish --access public
