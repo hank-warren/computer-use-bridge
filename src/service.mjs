@@ -9,7 +9,9 @@ export const LABEL = "com.hank-warren.computer-use-bridge";
 export const PLIST = join(homedir(), "Library/LaunchAgents", `${LABEL}.plist`);
 export const UNIT = join(homedir(), ".config/systemd/user", `${NAME}.service`);
 export const MAC_LOG = join(homedir(), "Library/Logs", `${NAME}.log`);
-export const BREW_PLIST = join(homedir(), "Library/LaunchAgents", `homebrew.mxcl.${NAME}.plist`);
+// 0.x's Homebrew service: newer Homebrew labels it sh.brew.*, older homebrew.mxcl.*.
+const BREW_LABELS = [`sh.brew.${NAME}`, `homebrew.mxcl.${NAME}`];
+const brewPlists = () => BREW_LABELS.map((l) => join(homedir(), "Library/LaunchAgents", `${l}.plist`)).filter((f) => existsSync(f));
 const MAC = process.platform === "darwin";
 
 export const binScript = () => realpathSync(fileURLToPath(new URL("../bin/computer-use-bridge.mjs", import.meta.url)));
@@ -158,10 +160,12 @@ export async function serviceState() {
 }
 
 // The 0.x Homebrew service, which holds the same port.
-export const brewServiceInstalled = () => MAC && existsSync(BREW_PLIST);
+export const brewServiceInstalled = () => MAC && brewPlists().length > 0;
 export async function stopBrewService() {
-  await run("/bin/launchctl", ["bootout", `gui/${uid()}/homebrew.mxcl.${NAME}`], 15_000);
-  rmSync(BREW_PLIST, { force: true });
+  const brew = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"].find((b) => existsSync(b));
+  if (brew) await run(brew, ["services", "stop", NAME], 60_000);
+  for (const l of BREW_LABELS) await run("/bin/launchctl", ["bootout", `gui/${uid()}/${l}`], 15_000);
+  for (const f of brewPlists()) rmSync(f, { force: true });
 }
 
 export const logHint = () => (MAC ? `tail -f ${MAC_LOG}` : `journalctl --user -u ${NAME} -f`);

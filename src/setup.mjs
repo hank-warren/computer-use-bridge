@@ -130,7 +130,7 @@ export function clientHelp(cfg, file) {
 Connect an agent: on the client machine (with ${NAME} installed there too), run
   ${NAME} connect ${name}${file !== DEFAULT_CONFIG ? ` --remote-config ${file}` : ""}
 It copies the token over SSH without printing it and adds "${name}" to pi's ~/.pi/agent/mcp.json
-(--print shows the Claude Code and Codex commands instead).
+(--print shows the configuration and the Claude Code command instead).
 Server: ${urls.join("; ")}`);
 }
 
