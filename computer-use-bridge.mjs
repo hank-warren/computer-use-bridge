@@ -21,7 +21,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { createInterface as createPrompt } from "node:readline/promises";
 
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const NAME = "computer-use-bridge";
 const CONFIG_DIR = join(homedir(), ".config", NAME);
@@ -115,6 +115,8 @@ function loadConfig(opts) {
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
   cfg.engineIdleMinutes ??= 10;
+  cfg.appEngine ??= "open-computer-use";
+  if (!["open-computer-use", "agent-desktop"].includes(cfg.appEngine)) throw new Error(`appEngine must be open-computer-use or agent-desktop (got ${J(cfg.appEngine)})`);
   if (cfg.engine !== undefined && cfg.engine !== "open-computer-use") {
     throw new Error(`engine "${cfg.engine}" is no longer supported: 0.5 runs only on open-computer-use; remove "engine" from ${file}`);
   }
@@ -467,6 +469,217 @@ class OcuChild {
     if (this.dead) return;
     this.dead = true;
     this.proc.kill("SIGTERM");
+  }
+}
+
+// ---------- agent-desktop engine (experimental, appEngine: "agent-desktop") ----------
+
+const AD_ENGINE = "agent-desktop";
+
+function findAd(cfg) {
+  if (cfg.adCommand) return expand(cfg.adCommand);
+  const dirs = [...(process.env.PATH ?? "").split(":"), dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin", join(homedir(), ".npm-global/bin")];
+  return dirs.filter(Boolean).map((d) => join(d, AD_ENGINE)).find((f) => existsSync(f)) ?? AD_ENGINE;
+}
+
+// xdotool key names (the press_key syntax) to agent-desktop's.
+const AD_MODS = { super: "cmd", cmd: "cmd", command: "cmd", meta: "cmd", ctrl: "ctrl", control: "ctrl", alt: "alt", option: "alt", shift: "shift" };
+const AD_KEYS = {
+  return: "return", kp_enter: "return", enter: "return", escape: "escape", tab: "tab", space: "space",
+  backspace: "delete", delete: "forwarddelete", up: "up", down: "down", left: "left", right: "right",
+  home: "home", end: "end", page_up: "pageup", prior: "pageup", page_down: "pagedown", next: "pagedown",
+};
+function adKey(spec) {
+  const parts = spec.split("+");
+  const key = parts.pop();
+  const mods = parts.map((m) => {
+    const v = AD_MODS[m.toLowerCase()];
+    if (!v) throw new BadInput(`unknown modifier ${m}`);
+    return v;
+  });
+  const k = AD_KEYS[key.toLowerCase()] ?? (/^F\d{1,2}$/i.test(key) ? key.toLowerCase() : /^KP_\d$/.test(key) ? key.slice(3) : key.length === 1 ? key : key.toLowerCase());
+  return [...mods, k].join("+");
+}
+
+// Secondary action names (as listed in the tree) to agent-desktop commands that take only a ref.
+const AD_SECONDARY = {
+  expand: "expand", collapse: "collapse", toggle: "toggle", check: "check", uncheck: "uncheck", focus: "focus",
+  "scroll-to": "scroll-to", scrollto: "scroll-to", "scroll to visible": "scroll-to", scrolltovisible: "scroll-to",
+  "right-click": "right-click", showmenu: "right-click", "show menu": "right-click", clear: "clear",
+};
+
+// agent-desktop's snapshot JSON as an open-computer-use style tree: numbered elements (the ones with
+// refs), one per line, indented by depth, and a closing focus line. Returns the text and the refs.
+function adTree(data) {
+  const refs = [];
+  const lines = [`App: ${data.app}${data.window?.title ? ` — window "${data.window.title}"` : ""}`];
+  let focused = null;
+  const one = (s, max = 2000) => {
+    const t = String(s).replace(/\s*\n\s*/g, " ⏎ ");
+    return t.length > max ? `${t.slice(0, max)}…` : t;
+  };
+  const walk = (n, depth) => {
+    let num = null;
+    if (n.ref_id) {
+      num = refs.length;
+      refs.push(n.ref_id);
+    }
+    const states = (n.states ?? []).filter((s) => !["enabled", "visible", "focusable"].includes(s));
+    if (num !== null && (n.states ?? []).includes("focused")) focused = num;
+    const actions = (n.available_actions ?? []).filter((x) => x.toLowerCase() !== "click");
+    let line = `${"\t".repeat(depth)}${num !== null ? `${num} ` : ""}${n.role}`;
+    if (states.length) line += ` (${states.join(", ")})`;
+    if (n.name) line += ` ${one(n.name)}`;
+    if (n.value !== undefined && n.value !== null && n.value !== "" && n.value !== n.name) line += `, Value: ${one(n.value)}`;
+    if (n.description && n.description !== n.name) line += `, Description: ${one(n.description, 500)}`;
+    if (num !== null && actions.length) line += `, Secondary Actions: ${actions.join(", ")}`;
+    if (n.children_count) line += ` [${n.children_count} children not shown]`;
+    else if (n.subtree_truncated) line += " [more not shown]";
+    lines.push(line);
+    for (const c of n.children ?? []) walk(c, depth + 1);
+  };
+  if (data.tree) walk(data.tree, 0);
+  if (data.complete === false) lines.push("[Partial tree: the app was slow to answer; call get_state again for more.]");
+  if (focused !== null) lines.push(`The focused UI element is ${focused}.`);
+  return { text: lines.join("\n"), refs, focused };
+}
+
+class AdError extends Error {
+  constructor(e) {
+    super(`${e.code ?? "ERROR"}: ${e.message ?? "agent-desktop failed"}${e.suggestion ? ` (${e.suggestion})` : ""}`);
+    this.code = e.code;
+  }
+}
+
+// agent-desktop (github.com/vercel-labs/agent-desktop) reads and operates apps through the
+// accessibility tree, headless, with refs that belong to one snapshot. This adapter answers
+// open-computer-use's tool calls, so clients see the same tools: element numbers map to the refs
+// of the latest tree, and each action returns a fresh tree.
+class AdEngine {
+  constructor(cfg, label) {
+    this.cfg = cfg;
+    this.label = label;
+    this.dead = false;
+    this.adSession = `cub-${randomUUID().slice(0, 8)}`;
+    this.trees = new Map(); // app id -> { refs, focused } of the latest tree
+    this.names = new Map(); // bundle id (lowercase) -> display name
+    this.queue = Promise.resolve();
+  }
+
+  // One envelope per command; resolves to data, throws AdError on an error envelope.
+  run(args, timeoutMs = 60_000) {
+    return new Promise((resolve, reject) => {
+      execFile(findAd(this.cfg), ["--session", this.adSession, ...args], { timeout: timeoutMs, maxBuffer: 256 * 1024 * 1024, env: childEnv() }, (e, stdout, stderr) => {
+        if (e?.code === "ENOENT") return reject(new Error(`agent-desktop not found; install it with "npm i -g agent-desktop" or set adCommand in the config`));
+        let env = null;
+        try { env = JSON.parse(String(stdout).trim().split("\n").pop()); } catch {}
+        if (env?.ok) return resolve(env.data ?? {});
+        if (env?.error) return reject(new AdError(env.error));
+        reject(new Error(`agent-desktop ${args[0]} failed: ${lastLine(String(stderr)) || e?.message || "no output"}`));
+      });
+    });
+  }
+
+  async start() {
+    const v = await this.run(["version"], 15_000);
+    log(`[${this.label}] agent-desktop ${v.version ?? ""} ready (session ${this.adSession})`);
+  }
+
+  async listApps() {
+    const d = await this.run(["list-apps"]);
+    const apps = (d.apps ?? []).filter((x) => x.bundle_id && x.presentation !== undefined);
+    this.names = new Map(apps.map((x) => [x.bundle_id.toLowerCase(), x.name]));
+    return apps;
+  }
+
+  async appName(id) {
+    if (!this.names.has(id.toLowerCase())) await this.listApps();
+    const name = this.names.get(id.toLowerCase());
+    if (!name) throw new BadInput(`${id} is not running; start it with launch_app`);
+    return name;
+  }
+
+  ref(id, el) {
+    const n = Number(el);
+    const ref = this.trees.get(id)?.refs[n];
+    if (ref === undefined) throw new BadInput(`element ${el} is not in the latest tree of ${id}; call get_state`);
+    return ref;
+  }
+
+  async snapshot(id) {
+    const d = await this.run(["snapshot", "--app", await this.appName(id), "--compact", "--max-depth", String(this.cfg.adMaxDepth ?? 30), "--timeout-ms", String(this.cfg.adTimeoutMs ?? 15_000)]);
+    const t = adTree(d);
+    this.trees.set(id, t);
+    return t.text;
+  }
+
+  async image(id) {
+    const d = await this.run(["screenshot", "--app", await this.appName(id)]);
+    return { type: "image", mimeType: `image/${d.format ?? "png"}`, data: d.data };
+  }
+
+  // The agent-desktop command line for one open-computer-use action.
+  async command(name, a) {
+    const id = a.app;
+    switch (name) {
+      case "click":
+        if (a.element_index === undefined) throw new BadInput("the agent-desktop engine clicks elements only (coordinates need physical input); give element");
+        if ((a.click_count ?? 1) > 1) throw new BadInput("the agent-desktop engine cannot double-click (it needs physical input)");
+        if (a.mouse_button === "middle") throw new BadInput("the agent-desktop engine cannot middle-click");
+        return [a.mouse_button === "right" ? "right-click" : "click", this.ref(id, a.element_index)];
+      case "type_text": {
+        const f = this.trees.get(id)?.focused;
+        if (f === null || f === undefined) throw new BadInput("the agent-desktop engine types into the focused element, and the latest tree has none; click a text field first, or use set_value");
+        return ["type", this.ref(id, f), a.text];
+      }
+      case "press_key": return ["press", adKey(a.key), "--app", await this.appName(id)];
+      case "set_value": return ["set-value", this.ref(id, a.element_index), a.value];
+      case "scroll": return ["scroll", this.ref(id, a.element_index), "--direction", a.direction, "--amount", String(Math.max(1, Math.round(a.pages * 3)))];
+      case "perform_secondary_action": {
+        const cmd = AD_SECONDARY[a.action.toLowerCase()] ?? AD_SECONDARY[a.action.toLowerCase().replace(/^ax/, "")];
+        if (!cmd) throw new BadInput(`the agent-desktop engine supports these secondary actions: ${[...new Set(Object.values(AD_SECONDARY))].join(", ")}`);
+        return [cmd, this.ref(id, a.element_index)];
+      }
+      case "drag": throw new BadInput("the agent-desktop engine cannot drag (it needs physical input)");
+      default: throw new BadInput(`unknown action ${name}`);
+    }
+  }
+
+  // open-computer-use's tool calls. opts.image adds a screenshot; opts.quiet skips the tree after an
+  // action (batch steps before the last), so element numbers stay those of the tree the client saw.
+  call(name, args, timeoutMs, opts = {}) {
+    const run = () => this.callOne(name, args, opts).catch((e) => {
+      if (e instanceof AdError) return { content: [{ type: "text", text: e.message }], isError: true };
+      throw e;
+    });
+    const p = this.queue.then(run, run);
+    this.queue = p.catch(() => {});
+    return p;
+  }
+
+  async callOne(name, a, opts) {
+    if (name === "list_apps") {
+      const apps = await this.listApps();
+      return { content: [{ type: "text", text: apps.map((x) => `${x.name} — ${x.bundle_id} [running]`).join("\n") }] };
+    }
+    if (name === "get_app_state") {
+      const content = [];
+      if (a.max_tree_nodes !== 1) content.push({ type: "text", text: await this.snapshot(a.app) });
+      if (opts.image || a.max_tree_nodes === 1) content.push(await this.image(a.app));
+      return { content };
+    }
+    const d = await this.run(await this.command(name, a));
+    let text = `${name}: ${d.disposition?.delivery ?? "done"}${d.surfaces?.length ? `; open: ${d.surfaces.map((s) => s.kind ?? s.surface ?? s).join(", ")}` : ""}`;
+    if (!opts.quiet) text += `\n${await this.snapshot(a.app)}`;
+    const content = [{ type: "text", text }];
+    if (opts.image && !opts.quiet) content.push(await this.image(a.app));
+    return { content };
+  }
+
+  async close() {
+    if (this.dead) return;
+    this.dead = true;
+    await new Promise((r) => execFile(findAd(this.cfg), ["session", "end", this.adSession], { timeout: 10_000, env: childEnv() }, () => r()));
   }
 }
 
@@ -995,7 +1208,7 @@ class Session {
   async cua() {
     if (this.child && !this.child.dead) return this.child;
     this.starting ??= (async () => {
-      const c = new OcuChild(this.cfg, this.label);
+      const c = this.cfg.appEngine === AD_ENGINE ? new AdEngine(this.cfg, this.label) : new OcuChild(this.cfg, this.label);
       await c.start();
       this.child = c;
       this.appNames = null;
@@ -1078,6 +1291,9 @@ class Session {
     }
     return `Computer use on the Mac "${hostname()}". Allowed apps: ${this.cfg.allowApps.join(", ") || "(none)"}. ` +
       "Call get_state(app) first; element numbers refer to the latest tree and change after every call. Actions return the window's tree. " +
+      (this.cfg.appEngine === AD_ENGINE
+        ? "Apps run on agent-desktop, which acts through accessibility only: click (left or right), set_value, scroll and the listed secondary actions take element numbers, type_text types into the tree's focused element, and press_key goes to the app without focusing it. There are no coordinate clicks, double clicks or drags; screenshots are for looking only. "
+        : "") +
       "Reading an app whose window is minimized or on another Space brings it forward, so prefer apps the user has on screen. " +
       (this.tabsOn
         ? "For web pages, use tabs: open_tab opens a background tab in your own tab group; pass its tab ID instead of app to get_state, screenshot, batch and the actions; read_tab, eval_tab and tab_locator work on tabs. You can act only on tabs you opened; the user's tabs and other agents' tabs are listed but off limits. "
@@ -1364,7 +1580,8 @@ class Session {
       return this.callTab(name, a, { cap, maxWidth });
     }
     if (!this.appsOn && name !== "release") throw new BadInput("this server has browser tabs only; give tab (from open_tab or list_tabs)");
-    const ocu = async (tool, args, timeoutMs = 60_000) => (await this.cua()).call(tool, args, timeoutMs);
+    // opts are for the agent-desktop engine (image, quiet); open-computer-use ignores them.
+    const ocu = async (tool, args, timeoutMs = 60_000, opts) => (await this.cua()).call(tool, args, timeoutMs, opts);
     switch (name) {
       case "release":
         return textResult(await this.stopEngine("released")
@@ -1383,7 +1600,7 @@ class Session {
       }
       case "get_state": {
         const id = await this.resolveApp(a.app);
-        const r = await ocu("get_app_state", { app: id, ...(cap === 0 ? { max_tree_nodes: 100_000 } : {}) });
+        const r = await ocu("get_app_state", { app: id, ...(cap === 0 ? { max_tree_nodes: 100_000 } : {}) }, 60_000, { image: a.screenshot === true });
         return this.shape(r, id, { cap, maxWidth, image: a.screenshot === true });
       }
       case "screenshot": {
@@ -1417,14 +1634,14 @@ class Session {
             last = null;
             continue;
           }
-          last = await ocu(...s.call);
+          last = await ocu(...s.call, 60_000, { quiet: i < steps.length - 1 });
           if (last.isError) {
             const out = await this.shape(last, id, { cap, maxWidth });
             out.content.unshift({ type: "text", text: `Batch stopped at step ${i + 1} (${s.action}).` });
             return out;
           }
         }
-        if (!last || a.screenshot === true) last = await ocu("get_app_state", { app: id });
+        if (!last || a.screenshot === true) last = await ocu("get_app_state", { app: id }, 60_000, { image: a.screenshot === true });
         return this.shape(last, id, { cap, maxWidth, image: a.screenshot === true });
       }
       default: {
@@ -1626,7 +1843,7 @@ function runHttp(cfg) {
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
   const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
   server.listen(cfg.port, cfg.host, () => {
-    log(`serving on http://${cfg.host}:${cfg.port}/mcp; ${cfg.appsOn ? `apps: ${cfg.allowApps.join(", ")}` : "browser tabs only"}`);
+    log(`serving on http://${cfg.host}:${cfg.port}/mcp; ${cfg.appsOn ? `apps (${cfg.appEngine}): ${cfg.allowApps.join(", ")}` : "browser tabs only"}`);
     for (const t of tunnels) t.start();
   });
   const stop = async () => {
@@ -1741,6 +1958,20 @@ async function prerequisites(cfg) {
   const ocu = findOcu(cfg);
   if (!APPS_SUPPORTED) {
     add(true, `apps: off (open-computer-use runs on macOS only; ${process.platform} gets browser tabs)`);
+  } else if (cfg.appEngine === AD_ENGINE) {
+    const ad = findAd(cfg);
+    if (!existsSync(ad)) add(false, "agent-desktop is not installed", "npm i -g agent-desktop, or set adCommand in the config");
+    else {
+      const r = await run(ad, ["permissions"], 30_000);
+      let p = null;
+      try { p = JSON.parse(r.stdout).data; } catch {}
+      if (!p) add(false, `agent-desktop permissions check failed: ${lastLine(r.stderr || r.stdout) || `exit ${r.code}`}`, "reinstall it with npm i -g agent-desktop");
+      else {
+        const ax = p.accessibility?.state, sr = p.screen_recording?.state;
+        add(ax === "granted", `agent-desktop (${ad}), as launched from here: Accessibility ${ax}, Screen Recording ${sr}`,
+          "grant Accessibility (and Screen Recording, for screenshots) to the app that launches the bridge: the terminal for stdio or a manual serve; see the README");
+      }
+    }
   } else if (!existsSync(ocu)) {
     add(false, "open-computer-use is not installed", "npm i -g open-computer-use, then run open-computer-use once and grant it Accessibility and Screen Recording");
   } else {
@@ -2042,7 +2273,7 @@ async function status(opts) {
     const tokenOk = existsSync(expand(cfg.tokenFile)) && readFileSync(expand(cfg.tokenFile), "utf8").trim().length >= 32;
     line(true, `config: ${file}`);
     line(tokenOk, `token: ${cfg.tokenFile}`);
-    say(`      listen http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.allowApps.join(", ") || "(none)"}; engine idle stop: ${cfg.engineIdleMinutes || "off"} min`);
+    say(`      listen http://${cfg.host}:${cfg.port}/mcp; apps (${cfg.appEngine}): ${cfg.allowApps.join(", ") || "(none)"}; engine idle stop: ${cfg.engineIdleMinutes || "off"} min`);
     for (const t of cfg.tunnels) say(`      tunnel to ${t.ssh}, port ${t.remotePort} there`);
   } catch (e) { line(false, `config: ${e.message}`); }
   const brew = brewPath();

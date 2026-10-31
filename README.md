@@ -98,6 +98,52 @@ computer-use-bridge update   # upgrade and restart
 then run `setup` again. It keeps your settings and token and drops the old
 `engine` key. ChatGPT is no longer needed.
 
+## Trying agent-desktop for apps (experimental)
+
+On macOS, `"appEngine": "agent-desktop"` runs app tools on Vercel's
+[agent-desktop](https://github.com/vercel-labs/agent-desktop) instead of
+open-computer-use. Clients see the same tools: the bridge numbers the elements
+of agent-desktop's snapshots and maps the numbers back to its refs, so a stale
+element comes back as `STALE_REF` rather than a click on whatever moved into
+its place. Browser tabs still use open-browser-use.
+
+What changes:
+
+- **Headless only.** `click` (left or right), `set_value`, `scroll` and
+  secondary actions (`Expand`, `Collapse`, `Toggle`, `Check`, `Focus`, ...)
+  use accessibility actions, without focus or cursor movement. `press_key`
+  goes to the app's process without focusing it. `type_text` types into the
+  focused element of the latest tree.
+- **No physical input.** Coordinate clicks, double clicks and drags are
+  refused, so apps with little accessibility (games such as Balatro) need
+  open-computer-use. Screenshots are for looking only.
+- **Permissions belong to the launcher.** agent-desktop has no app bundle of
+  its own, so macOS checks the app that started the bridge. The Homebrew
+  service runs Homebrew's ad-hoc signed `node`, so a grant would cover every
+  program that `node` runs and lapse with each Node upgrade. To try it, run a
+  second server from a terminal that has Accessibility (and Screen Recording,
+  for screenshots), on another port, and leave the service on
+  open-computer-use:
+
+  ```bash
+  npm i -g agent-desktop
+  agent-desktop permissions            # as seen from this terminal
+  mkdir -p ~/.config/cub-ad-trial
+  jq '.port = 47801 | .appEngine = "agent-desktop" | .tunnels = []' \
+    ~/.config/computer-use-bridge/config.json > ~/.config/cub-ad-trial/config.json
+  computer-use-bridge status --config ~/.config/cub-ad-trial/config.json
+  computer-use-bridge serve --config ~/.config/cub-ad-trial/config.json
+  ```
+
+  Clients use the same token at port 47801.
+
+| Key | Meaning |
+|---|---|
+| `appEngine` | `open-computer-use` (default) or `agent-desktop`. |
+| `adCommand` | Path to `agent-desktop`, if it is not on `PATH` or in the npm global bin. |
+| `adMaxDepth` | Snapshot depth (default 30). |
+| `adTimeoutMs` | Snapshot time limit in milliseconds (default 15000; cold Electron apps can need it). |
+
 ## Linux (browser tabs only)
 
 open-computer-use controls apps only on macOS, so on Linux the bridge serves
