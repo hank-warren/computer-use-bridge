@@ -5,8 +5,8 @@ import { NAME, VERSION, childEnv, log } from "../common.mjs";
 // An engine's own MCP server over stdio (`ocu mcp`, `obu mcp`), started on demand. The bridge
 // forwards its tools as they are; this only speaks the protocol and keeps one call in flight.
 export class McpChild {
-  constructor({ name, command, args = [], env = {}, label = "", missing }) {
-    Object.assign(this, { name, command, args, env, label, missing });
+  constructor({ name, command, args = [], env = {}, label = "", missing, startTimeoutMs }) {
+    Object.assign(this, { name, command, args, env, label, missing, startTimeoutMs });
     this.pending = new Map();
     this.nextId = 1;
     this.queue = Promise.resolve();
@@ -26,11 +26,17 @@ export class McpChild {
     this.proc.on("exit", (code, sig) => died(`${this.name} exited (${code ?? sig})`));
     this.proc.stdin.on("error", () => {});
     createInterface({ input: this.proc.stdout }).on("line", (line) => this.onLine(line));
-    const init = await this.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: NAME, version: VERSION } }, 60_000);
-    this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
-    this.version = init?.serverInfo?.version ?? "";
-    this.instructions = init?.instructions ?? "";
-    this.tools = (await this.request("tools/list", {}, 60_000))?.tools ?? [];
+    try {
+      const init = await this.request("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: NAME, version: VERSION } }, this.startTimeoutMs ?? 60_000);
+      this.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+      this.version = init?.serverInfo?.version ?? "";
+      this.instructions = init?.instructions ?? "";
+      this.tools = (await this.request("tools/list", {}, this.startTimeoutMs ?? 60_000))?.tools ?? [];
+    } catch (e) {
+      // Nobody holds a child that failed to start, so it must not keep running.
+      await this.close();
+      throw e;
+    }
     log(`[${this.label}] ${this.name} ${this.version} started`);
     return this;
   }
@@ -78,8 +84,8 @@ export class McpChild {
   }
 
   async close() {
-    if (this.dead) return;
+    const alive = this.proc && this.proc.exitCode === null && this.proc.signalCode === null;
     this.dead = true;
-    this.proc.kill("SIGTERM");
+    if (alive) this.proc.kill("SIGTERM");
   }
 }

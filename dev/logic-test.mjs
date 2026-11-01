@@ -156,6 +156,23 @@ createInterface({ input: process.stdin }).on("line", (l) => {
     let err = "";
     try { await c.call("die", {}); } catch (e) { err = e.message; }
     assert(/fake exited \(3\)/.test(err) && c.dead, "a server that exits fails its call and marks the child dead");
+    // A server that answers the handshake with an error, or not at all, and stays up is stopped.
+    const stubborn = join(dir, "stubborn.mjs");
+    writeFileSync(stubborn, `
+import { createInterface } from "node:readline";
+createInterface({ input: process.stdin }).on("line", (l) => {
+  const m = JSON.parse(l);
+  if (process.argv[2] === "error" && m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, error: { code: -1, message: "not ready" } }) + "\\n");
+});
+setInterval(() => {}, 1000);
+`);
+    for (const mode of ["error", "silent"]) {
+      const child = new McpChild({ name: "stubborn", command: process.execPath, args: [stubborn, mode], startTimeoutMs: 300 });
+      let why = "";
+      try { await child.start(); } catch (e) { why = e.message; }
+      const exited = await new Promise((r) => (child.proc.exitCode !== null || child.proc.signalCode !== null ? r(true) : (child.proc.once("exit", () => r(true)), setTimeout(() => r(false), 2000))));
+      assert((mode === "error" ? /not ready/ : /timed out/).test(why) && exited, `a child whose handshake ${mode === "error" ? "fails" : "times out"} is stopped`);
+    }
     let missing = "";
     try { await new McpChild({ name: "x", command: join(dir, "nope"), missing: "x is missing; install it" }).start(); } catch (e) { missing = e.message; }
     assert(missing === "x is missing; install it", "a missing command says how to install it");
