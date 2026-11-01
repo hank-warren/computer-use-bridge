@@ -146,7 +146,7 @@ edit it and restart the service (`computer-use-bridge setup --yes` rewrites and 
 | `idleMinutes` | Close a client session after this long without a request (default 30). |
 | `maxSessions` | Most client sessions at once; the least recently used is closed beyond this (default 4). |
 | `engineIdleMinutes` | Stop a session's engines after this long without a call (default 10; 0 never). The next call starts them again. |
-| `ocuVisualCursor` | `true` shows open-computer-use's on-screen cursor for app clicks (default off). |
+| `ocuVisualCursor` | `false` hides open-computer-use's on-screen cursor for app actions; unset keeps the engine's default (shown). |
 | `ocuCommand`, `obuCommand` | Engine paths, if they are not on the service's `PATH`. |
 | `obuSocket` | open-browser-use socket to use when several browsers run its extension (`ls /tmp/open-browser-use`). |
 
