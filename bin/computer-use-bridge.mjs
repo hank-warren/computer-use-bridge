@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-// computer-use-bridge: lets remote MCP clients use this machine's apps (macOS, through
-// open-computer-use or agent-desktop) and browser tabs (through open-browser-use), over
-// bearer-authenticated HTTP or stdio. Clients get typed tools, an app allowlist and their own tabs;
-// no client-supplied code runs here (eval_tab runs in the page with side effects refused).
+// computer-use-bridge: serves this machine's open-computer-use (macOS apps) and open-browser-use
+// (browser tabs) MCP tools, unchanged, to remote clients over bearer-authenticated HTTP or stdio,
+// with an app allowlist.
 // Run with no arguments for the commands.
 
 import { VERSION, log, say } from "../src/common.mjs";

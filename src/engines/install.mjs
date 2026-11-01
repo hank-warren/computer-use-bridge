@@ -3,27 +3,18 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { lastLine, run } from "../common.mjs";
 import { BROWSER_IDS } from "../config.mjs";
-import { findAd } from "./agent-desktop.mjs";
-import { ObuBrowser } from "./open-browser-use.mjs";
-import { findOcu } from "./open-computer-use.mjs";
+import { findObu, findOcu, obuChild } from "./native.mjs";
 
 // The engine versions this release is tested with. setup installs these; status warns when the
-// installed major version differs.
+// installed version differs.
 export const ENGINES = {
   "open-computer-use": { pin: "1.1.2", find: findOcu, repo: "https://github.com/iFurySt/open-computer-use" },
-  "agent-desktop": { pin: "1.0.2", find: findAd, repo: "https://github.com/vercel-labs/agent-desktop" },
   "open-browser-use": { pin: "1.1.0", find: findObu, repo: "https://github.com/iFurySt/open-browser-use" },
 };
 
 export const OBU_STORE = "https://chromewebstore.google.com/detail/open-browser-use/bgjoihaepiejlfjinojjfgokghnodnhd";
 const MAC = process.platform === "darwin";
 const OBU_HOST = "NativeMessagingHosts/com.ifuryst.open_browser_use.extension.json";
-
-export function findObu(cfg = {}) {
-  if (cfg.obuCommand) return cfg.obuCommand;
-  const dirs = [...(process.env.PATH ?? "").split(":"), dirname(process.execPath), "/opt/homebrew/bin", "/usr/local/bin", join(homedir(), ".npm-global/bin")];
-  return dirs.filter(Boolean).map((d) => join(d, "open-browser-use")).find((f) => existsSync(f)) ?? "open-browser-use";
-}
 
 // The npm package version behind an installed command, from its package.json.
 export function installedVersion(name, cfg = {}) {
@@ -39,12 +30,11 @@ export function installedVersion(name, cfg = {}) {
   return "unknown";
 }
 
-const major = (v) => Number(String(v).split(".")[0]);
 export const engineCheck = (name, cfg) => {
   const v = installedVersion(name, cfg);
   const pin = ENGINES[name].pin;
   if (!v) return { ok: false, what: `${name} is not installed`, fix: `npm i -g ${name}@${pin} (or let "setup" install it)` };
-  if (v !== "unknown" && major(v) !== major(pin)) return { ok: true, warn: true, what: `${name} ${v} (this release is tested with ${pin})`, fix: `npm i -g ${name}@${pin}` };
+  if (v !== "unknown" && v !== pin) return { ok: true, warn: true, what: `${name} ${v} (this release is tested with ${pin})`, fix: `npm i -g ${name}@${pin}` };
   return { ok: true, what: `${name} ${v}` };
 };
 
@@ -87,17 +77,24 @@ export function obuManifestCheck(browser) {
   return { ok: true, what: `open-browser-use native host registered (${f})` };
 }
 
-export async function extensionCheck(cfg) {
-  const b = new ObuBrowser(cfg, "check");
+// Asks open-browser-use's own MCP server for its backend info, as an agent's first call would.
+export async function extensionCheck(cfg, child = obuChild) {
+  const name = cfg.tabs?.browser === "chrome" ? "Chrome" : "Brave";
+  const fail = (why) => ({ ok: false, human: true, what: `open-browser-use extension is not connected: ${why}`, fix: `in ${name}, install Open Browser Use from ${OBU_STORE} (one profile, the one agents should use), then quit and reopen ${name}` });
+  let c;
   try {
-    const tabs = await b.userTabs();
-    if (b.scanned) return { ok: true, warn: true, what: `open-browser-use extension connected (${tabs.length} tabs; found by socket scan: ${b.scanned})`, fix: "optional: disable and re-enable the extension so its native host rewrites active.json" };
-    return { ok: true, what: `open-browser-use extension connected (${tabs.length} tabs)` };
+    c = await child(cfg, "check", "computer-use-bridge-check").start();
+    const r = await c.call("info", {}, 15_000);
+    const text = (r?.content ?? []).filter((x) => x.type === "text").map((x) => x.text).join(" ");
+    if (r?.isError) return fail(text || "no answer");
+    let info = r?.structuredContent?.result;
+    try { info ??= JSON.parse(text).result; } catch {}
+    const what = [info?.name ?? info?.browserName, info?.version ?? info?.extensionVersion].filter(Boolean).join(" ");
+    return { ok: true, what: `open-browser-use extension connected${what ? ` (${what})` : ""}` };
   } catch (e) {
-    const name = cfg.tabs?.browser === "chrome" ? "Chrome" : "Brave";
-    return { ok: false, human: true, what: `open-browser-use extension is not connected: ${e.message}`, fix: `in ${name}, install Open Browser Use from ${OBU_STORE} (one profile, the one agents should use), then quit and reopen ${name}` };
+    return fail(e.message);
   } finally {
-    await b.close();
+    await c?.close();
   }
 }
 
@@ -120,19 +117,5 @@ export async function ocuPermissions(cfg) {
   return { ok, human: !ok, what: `open-computer-use permissions: Accessibility ${ax}, Screen Recording ${sr}`, fix };
 }
 export const ocuOnboard = (cfg) => run(findOcu(cfg), ["doctor"], 60_000);
-
-export async function adPermissions(cfg) {
-  const r = await run(findAd(cfg), ["permissions"], 30_000);
-  let p = null;
-  try { p = JSON.parse(r.stdout).data; } catch {}
-  if (!p) return { ok: false, what: `agent-desktop permissions check failed: ${lastLine(r.stderr || r.stdout) || `exit ${r.code}`}`, fix: `npm i -g agent-desktop@${ENGINES["agent-desktop"].pin}` };
-  const ax = p.accessibility?.state;
-  const sr = p.screen_recording?.state;
-  return {
-    ok: ax === "granted", warn: ax === "granted" && sr !== "granted", human: ax !== "granted",
-    what: `agent-desktop permissions, as launched from here: Accessibility ${ax}, Screen Recording ${sr}`,
-    fix: "macOS grants agent-desktop through the app that launches it. Grant Accessibility (and Screen Recording, for screenshots) to that app; see the README's agent-desktop section",
-  };
-}
 
 export const browserId = (cfg) => BROWSER_IDS[cfg.tabs?.browser ?? "brave"];

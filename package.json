@@ -1,8 +1,8 @@
 {
   "name": "computer-use-bridge",
-  "version": "1.0.2",
-  "description": "Let remote MCP clients (pi, Claude Code, Codex) use a machine's apps and browser tabs through open-computer-use, agent-desktop and open-browser-use, over Tailscale or SSH with a token and an allowlist.",
-  "keywords": ["mcp", "computer-use", "browser-use", "agent", "open-computer-use", "open-browser-use", "agent-desktop", "tailscale"],
+  "version": "2.0.0",
+  "description": "Serve open-computer-use and open-browser-use's own MCP tools to remote clients (pi, Claude Code, Codex), over Tailscale or SSH with a token and an app allowlist.",
+  "keywords": ["mcp", "computer-use", "browser-use", "agent", "open-computer-use", "open-browser-use", "tailscale"],
   "homepage": "https://github.com/hank-warren/computer-use-bridge",
   "repository": { "type": "git", "url": "git+https://github.com/hank-warren/computer-use-bridge.git" },
   "bugs": "https://github.com/hank-warren/computer-use-bridge/issues",

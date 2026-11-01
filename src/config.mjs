@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { APPS_SUPPORTED, DEFAULT_CONFIG, HARD_DENY, NAME, expand } from "./common.mjs";
 
-export const APP_ENGINES = ["open-computer-use", "agent-desktop"];
+export const APP_ENGINES = ["open-computer-use"];
 export const TAB_ENGINES = ["open-browser-use"];
 // Browsers open-browser-use runs in, by the name the config uses.
 export const BROWSER_IDS = { brave: "com.brave.Browser", chrome: "com.google.Chrome" };
@@ -14,9 +14,8 @@ export const USAGE = `usage: ${NAME} <command> [options]
 On the machine agents control (macOS: apps and browser tabs; Linux: browser tabs):
   setup     install the engines, write the config, install and start the service (asks;
             --yes takes defaults). Options:
-              --apps open-computer-use|agent-desktop|off   engine for apps (macOS)
+              --apps open-computer-use|off  app control (macOS)
               --allow ID,ID                 bundle IDs agents may control
-              --engine-for ID=ENGINE,...    per-app engine override
               --tabs brave|chrome|off       browser for open-browser-use tabs
               --host IP|tailscale|localhost  --port N  --tunnel SSH_HOST[:PORT],...
               --yes  --no-service  --no-install
@@ -36,7 +35,7 @@ setup, status, update, serve and stdio take --config FILE (default ${DEFAULT_CON
 
 const COMMANDS = ["setup", "status", "update", "serve", "stdio", "connect", "client-info", "version", "help"];
 const FLAGS = {
-  setup: { "--apps": "apps", "--allow": "allow", "--engine-for": "engineFor", "--tabs": "tabs", "--host": "host", "--port": "port", "--tunnel": "tunnel" },
+  setup: { "--apps": "apps", "--allow": "allow", "--tabs": "tabs", "--host": "host", "--port": "port", "--tunnel": "tunnel" },
   connect: { "--name": "name", "--pi-config": "piConfig", "--remote-config": "remoteConfig", "--tunnel-name": "tunnelName", "--remote-bin": "remoteBin" },
 };
 const SWITCHES = {
@@ -80,19 +79,37 @@ export function checkTunnel(t) {
   return { ssh: t.ssh, remotePort: t.remotePort };
 }
 
-// 0.x configs turned tabs on by listing a browser in allowApps; 1.0 has explicit apps and tabs.
+// Settings of 1.x's own tools and its agent-desktop engine, which 2.0 dropped.
+export const REMOVED_KEYS = ["treeMaxChars", "screenshotMaxWidth", "tabEval", "obuCursor", "obuRegistry", "adCommand", "adMaxDepth", "adTimeoutMs"];
+
+// 0.x configs turned tabs on by listing a browser in allowApps; 1.x could run apps on
+// agent-desktop. Both load as open-computer-use with explicit apps and tabs.
 export function migrateConfig(raw, appsSupported = APPS_SUPPORTED) {
-  if (raw.apps !== undefined || raw.tabs !== undefined || raw.allowApps === undefined) return { cfg: raw, migrated: false };
-  const cfg = { ...raw };
-  const allow = cfg.allowApps;
-  const has = (id) => allow.some((x) => x.toLowerCase() === id.toLowerCase());
-  const browser = Object.keys(BROWSER_IDS).find((b) => has(BROWSER_IDS[b]));
-  cfg.apps = appsSupported ? { engine: cfg.appEngine ?? "open-computer-use", allow } : { engine: "off" };
-  cfg.tabs = browser ? { engine: "open-browser-use", browser } : { engine: "off" };
-  delete cfg.allowApps;
-  delete cfg.appEngine;
-  if (cfg.engine === "open-computer-use") delete cfg.engine;
-  return { cfg, migrated: true };
+  let cfg = { ...raw };
+  let migrated = false;
+  if (cfg.apps === undefined && cfg.tabs === undefined && cfg.allowApps !== undefined) {
+    const allow = cfg.allowApps;
+    const has = (id) => allow.some((x) => x.toLowerCase() === id.toLowerCase());
+    const browser = Object.keys(BROWSER_IDS).find((b) => has(BROWSER_IDS[b]));
+    cfg.apps = appsSupported ? { engine: "open-computer-use", allow } : { engine: "off" };
+    cfg.tabs = browser ? { engine: "open-browser-use", browser } : { engine: "off" };
+    delete cfg.allowApps;
+    delete cfg.appEngine;
+    if (cfg.engine === "open-computer-use") delete cfg.engine;
+    migrated = true;
+  }
+  if (cfg.apps?.engine === "agent-desktop" || cfg.apps?.engineFor !== undefined) {
+    const { engineFor: _, ...apps } = cfg.apps;
+    cfg = { ...cfg, apps: { ...apps, engine: apps.engine === "agent-desktop" ? "open-computer-use" : apps.engine } };
+    migrated = true;
+  }
+  for (const k of REMOVED_KEYS) {
+    if (k in cfg) {
+      delete cfg[k];
+      migrated = true;
+    }
+  }
+  return { cfg, migrated };
 }
 
 const oneOf = (v, list, what) => {
@@ -101,11 +118,11 @@ const oneOf = (v, list, what) => {
 };
 
 // Validates a config (either version) and adds the derived fields the server uses:
-// appsOn, tabsOn, allowApps, isAllowed(id), appEngine and appEngineFor(id).
+// appsOn, tabsOn, allowApps, isAllowed(id) and canonicalId(id).
 export function normalizeConfig(raw, { file = "config", approveAll = false, appsSupported = APPS_SUPPORTED } = {}) {
   const { cfg } = migrateConfig(structuredClone(raw), appsSupported);
   if (cfg.engine !== undefined) throw new Error(`${file}: "engine" is no longer supported; remove it and set apps.engine`);
-  const apps = { engine: "off", allow: [], engineFor: {}, ...cfg.apps };
+  const apps = { engine: "off", allow: [], ...cfg.apps };
   const tabs = { engine: "off", browser: "brave", ...cfg.tabs };
   oneOf(apps.engine, [...APP_ENGINES, "off"], "apps.engine");
   oneOf(tabs.engine, [...TAB_ENGINES, "off"], "tabs.engine");
@@ -113,19 +130,16 @@ export function normalizeConfig(raw, { file = "config", approveAll = false, apps
   if (!appsSupported && apps.engine !== "off") throw new Error(`${file}: app control needs macOS; set apps.engine to "off" (browser tabs work here)`);
   if (apps.engine === "off" && tabs.engine === "off") throw new Error(`${file}: apps and tabs are both off, so there is nothing to serve; run "${NAME} setup"`);
   if (!Array.isArray(apps.allow) || !apps.allow.every((x) => typeof x === "string")) throw new Error(`${file}: apps.allow must be a list of bundle IDs`);
-  for (const [id, e] of Object.entries(apps.engineFor)) oneOf(e, APP_ENGINES, `apps.engineFor["${id}"]`);
   cfg.apps = apps;
   cfg.tabs = tabs;
   cfg.approve = approveAll ? "all" : "allowlist";
   cfg.appsOn = apps.engine !== "off";
   cfg.tabsOn = tabs.engine !== "off";
   cfg.allowApps = cfg.appsOn ? apps.allow.filter((id) => !HARD_DENY.has(id.toLowerCase())) : [];
-  const allowed = new Set(cfg.allowApps.map((id) => id.toLowerCase()));
-  cfg.isAllowed = (id) => cfg.appsOn && (cfg.approve === "all" || (typeof id === "string" && allowed.has(id.toLowerCase())));
-  const engineFor = new Map(Object.entries(apps.engineFor).map(([id, e]) => [id.toLowerCase(), e]));
-  cfg.appEngine = apps.engine;
-  cfg.appEngineFor = (id) => engineFor.get(String(id).toLowerCase()) ?? apps.engine;
-  cfg.appEngines = cfg.appsOn ? [...new Set([apps.engine, ...engineFor.values()])] : [];
+  const allowed = new Map(cfg.allowApps.map((id) => [id.toLowerCase(), id]));
+  // HARD_DENY holds even with --approve-all.
+  cfg.isAllowed = (id) => cfg.appsOn && typeof id === "string" && !HARD_DENY.has(id.toLowerCase()) && (cfg.approve === "all" || allowed.has(id.toLowerCase()));
+  cfg.canonicalId = (id) => allowed.get(id.toLowerCase()) ?? id;
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;
   cfg.engineIdleMinutes ??= 10;

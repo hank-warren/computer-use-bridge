@@ -4,8 +4,7 @@ import { readFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createInterface } from "node:readline";
 import { NAME, PROTOCOL_VERSIONS, VERSION, expand, log } from "./common.mjs";
-import { textResult } from "./tools.mjs";
-import { Session } from "./session.mjs";
+import { Session, textResult } from "./session.mjs";
 
 // ---------- MCP server side ----------
 
@@ -22,7 +21,7 @@ export async function handle(session, msg) {
           protocolVersion: PROTOCOL_VERSIONS.includes(asked) ? asked : PROTOCOL_VERSIONS[1],
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: NAME, version: VERSION },
-          instructions: session.instructions(),
+          instructions: await session.instructions(),
         });
       }
       case "ping": return ok({});
@@ -198,7 +197,7 @@ export function runHttp(cfg) {
   server.on("error", (e) => { log(`listen failed: ${e.message}`); process.exit(1); });
   const tunnels = cfg.tunnels.map((t) => new Tunnel(t, cfg));
   server.listen(cfg.port, cfg.host, () => {
-    log(`serving on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.appsOn ? `${cfg.appEngines.join(" + ")} (${cfg.allowApps.join(", ")})` : "off"}; tabs: ${cfg.tabsOn ? `${cfg.tabs.engine} (${cfg.tabs.browser})` : "off"}`);
+    log(`serving on http://${cfg.host}:${cfg.port}/mcp; apps: ${cfg.appsOn ? `open-computer-use (${cfg.allowApps.join(", ")})` : "off"}; tabs: ${cfg.tabsOn ? `${cfg.tabs.engine} (${cfg.tabs.browser})` : "off"}`);
     for (const t of tunnels) t.start();
   });
   const stop = async () => {

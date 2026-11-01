@@ -1,7 +1,8 @@
 # AGENTS.md: computer-use-bridge
 
 computer-use-bridge lets MCP clients (pi, Claude Code, Codex) use one machine's apps (macOS) and
-browser tabs (macOS, Linux). There are two roles: the **server**, the machine agents will
+browser tabs (macOS, Linux) through the native MCP servers of open-computer-use and
+open-browser-use, when the agent runs elsewhere. There are two roles: the **server**, the machine agents will
 control, and the **client**, the machine the agent runs on. Both need Node 20+ and the npm package.
 
 ## Setting it up for a user
@@ -43,42 +44,44 @@ Then the user reloads pi. Rules while doing this:
 - Never print, `cat`, echo or paste the token. `connect` moves it over SSH into a mode-600 file.
 - Do not run any of it with `sudo`, and do not hand-edit the LaunchAgent or systemd unit: run
   `setup --yes` again.
-- agent-desktop (`--apps agent-desktop`) needs Accessibility granted to the app that launches the
-  bridge; read the README's "Choosing an app engine" before offering it.
 
 ## Working on the code
+
+**Keep the bridge dead simple: it is a remote transport for the engines' own MCP servers.** Agents
+must get `ocu mcp` and `obu mcp` tools exactly as those engines publish them. Do not add, rename,
+wrap or re-describe tools, reshape results, or work around engine behaviour in the bridge; report
+engine bugs upstream and bump the pin when they are fixed. The bridge's own logic is limited to
+transport (HTTP with a token, stdio, tunnels), sessions and engine processes, the app allowlist,
+and setup/status/update/service.
 
 | Path | What |
 |---|---|
 | `bin/computer-use-bridge.mjs` | CLI entry. |
 | `src/config.mjs` | Arguments, config v2 (`apps`, `tabs`), 0.x migration, validation. |
-| `src/session.mjs` | One MCP session: tools to engines, the allowlist, own-tabs-only. |
+| `src/session.mjs` | One MCP session: starts the engines' MCP servers, passes their tools through, applies the app allowlist. |
 | `src/server.mjs` | HTTP (bearer token) and stdio transports, reverse SSH tunnels. |
-| `src/tools.mjs` | Tool schemas and argument checks. |
-| `src/engines/*.mjs` | Engine adapters (open-computer-use, agent-desktop, open-browser-use) and `install.mjs`: tested versions (`ENGINES` pins), installs, permission and extension checks. |
+| `src/engines/mcp-child.mjs` | MCP client for an engine's stdio server. |
+| `src/engines/native.mjs` | How each engine's server is found and started. |
+| `src/engines/install.mjs` | Tested versions (`ENGINES` pins), installs, permission and extension checks. |
 | `src/service.mjs` | LaunchAgent (macOS) and systemd user unit (Linux). |
 | `src/setup.mjs`, `src/connect.mjs` | `setup`, `status`, `update`; `connect` and `client-info`. |
-| `dev/logic-test.mjs` | Engine-free tests with fake engines; `npm test`. CI runs it on macOS and Linux. |
-| `dev/live-test.mjs` | Every tool against real engines over stdio or HTTP: Calculator for apps, public pages for tabs. |
+| `dev/logic-test.mjs` | Engine-free tests with fake engines and a fake MCP server; `npm test`. CI runs it on macOS and Linux. |
+| `dev/live-test.mjs` | The native tools through the bridge against real engines over stdio or HTTP: Calculator for apps, example.com for tabs, and the allowlist. |
 | `dev/mcp-call.mjs` | Small MCP client for driving a server over stdio by hand. |
 
-- **The security boundary is the product.** `HARD_DENY` (in `src/common.mjs`) and `apps.allow`
-  gate every app call; agents act only on tabs they opened; the HTTP token comparison stays
-  constant-time; clients never send code. `.github/pi/review.md` lists what review blocks on.
-- **Engine output contracts.** Changing how engine output is parsed (`list_apps` lines,
-  `doctor --json`, trees and their focus line, agent-desktop envelopes, open-browser-use messages)
-  needs a test in `dev/logic-test.mjs`. Bump an `ENGINES` pin only after `dev/live-test.mjs`
-  passes against the new version.
-- **Element numbers belong to the tree the client saw.** open-computer-use renumbers on every call,
-  so its adapter maps numbers to the engine's latest tree (`ocuRemap`) and refuses an element that
-  changed; agent-desktop's refs and tab DOM nodes stay put by themselves.
+- **The boundary.** `HARD_DENY` (in `src/common.mjs`) and `apps.allow` gate every
+  open-computer-use call through its `app` argument, and an open-computer-use tool without `app` is
+  not offered; the HTTP token comparison stays constant-time. open-browser-use's tools pass
+  through in full, by decision. `.github/pi/review.md` lists what review blocks on.
+- **Engine output contracts.** The bridge parses only `list_apps` lines, `doctor --json` and
+  open-browser-use's `info`; changing that needs a test in `dev/logic-test.mjs`. Bump an `ENGINES`
+  pin only after `dev/live-test.mjs` passes against the new version.
 - **Config compatibility.** Older config files must keep loading: extend `migrateConfig`.
 - **Live tests never touch the user's running service.** `npm pack`, copy the tarball to the
   target, `npm i -g --prefix /tmp/cubtest <tgz>`, then `setup --yes --no-service --config
   /tmp/cubtest/config.json --port 47899` and `dev/live-test.mjs` over SSH against
   `.../bin/computer-use-bridge.mjs stdio --config /tmp/cubtest/config.json` (allow
-  `com.apple.calculator`). agent-desktop needs a server started from a terminal with Accessibility;
-  test it with `--url` and `--token-file`. Clean up afterwards.
+  `com.apple.calculator`). Test HTTP with `--url` and `--token-file`. Clean up afterwards.
 - **Versions** live only in `package.json`.
 
 ## Releasing
