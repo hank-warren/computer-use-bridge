@@ -91,7 +91,7 @@ export function migrateConfig(raw, appsSupported = APPS_SUPPORTED) {
     const allow = cfg.allowApps;
     const has = (id) => allow.some((x) => x.toLowerCase() === id.toLowerCase());
     const browser = Object.keys(BROWSER_IDS).find((b) => has(BROWSER_IDS[b]));
-    cfg.apps = appsSupported ? { engine: "open-computer-use", allow } : { engine: "off" };
+    cfg.apps = appsSupported && cfg.appEngine !== "off" ? { engine: "open-computer-use", allow } : { engine: "off" };
     cfg.tabs = browser ? { engine: "open-browser-use", browser } : { engine: "off" };
     delete cfg.allowApps;
     delete cfg.appEngine;
@@ -118,7 +118,7 @@ const oneOf = (v, list, what) => {
 };
 
 // Validates a config (either version) and adds the derived fields the server uses:
-// appsOn, tabsOn, allowApps, isAllowed(id) and canonicalId(id).
+// appsOn, tabsOn, allowApps, isAllowed(id), listed(id) and canonicalId(id).
 export function normalizeConfig(raw, { file = "config", approveAll = false, appsSupported = APPS_SUPPORTED } = {}) {
   const { cfg } = migrateConfig(structuredClone(raw), appsSupported);
   if (cfg.engine !== undefined) throw new Error(`${file}: "engine" is no longer supported; remove it and set apps.engine`);
@@ -139,6 +139,7 @@ export function normalizeConfig(raw, { file = "config", approveAll = false, apps
   const allowed = new Map(cfg.allowApps.map((id) => [id.toLowerCase(), id]));
   // HARD_DENY holds even with --approve-all.
   cfg.isAllowed = (id) => cfg.appsOn && typeof id === "string" && !HARD_DENY.has(id.toLowerCase()) && (cfg.approve === "all" || allowed.has(id.toLowerCase()));
+  cfg.listed = (id) => cfg.appsOn && typeof id === "string" && allowed.has(id.toLowerCase());
   cfg.canonicalId = (id) => allowed.get(id.toLowerCase()) ?? id;
   cfg.idleMinutes ??= 30;
   cfg.maxSessions ??= 4;

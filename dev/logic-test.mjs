@@ -84,6 +84,12 @@ function fakeEngines() {
   assert(apps === "Brave Browser — com.brave.Browser [running]\nDiscord — com.hnc.Discord [running]", "list_apps shows allowed apps only");
   const all = new Session(normalizeConfig({ apps: { engine: "open-computer-use", allow: [] }, engineIdleMinutes: 0 }, { appsSupported: true, approveAll: true }), "t", { start: fakeEngines().start });
   assert(!/ghostty/i.test(text(await all.callTool("list_apps", {}))) && (await all.callTool("click", { app: "com.mitchellh.ghostty" })).isError, "--approve-all still keeps hard-denied apps out");
+  assert((await all.callTool("click", { app: "Ghostty" })).isError && (await all.callTool("click", { app: "ghost" })).isError, "--approve-all checks hard-deny on the bundle ID a name resolves to");
+  assert((await all.callTool("click", { app: "Terminal" })).isError && (await all.callTool("click", { app: "Terminal.app" })).isError, "--approve-all refuses names list_apps cannot resolve");
+  const ok = fakeEngines();
+  const all2 = new Session(normalizeConfig({ apps: { engine: "open-computer-use", allow: [] }, engineIdleMinutes: 0 }, { appsSupported: true, approveAll: true }), "t", { start: ok.start });
+  await all2.callTool("click", { app: "Discord" });
+  assert(ok.calls.find((c) => c.name === "click")?.args.app === "com.hnc.Discord", "--approve-all sends the resolved bundle ID");
   assert(parseAppLine("Brave Browser — com.brave.Browser [running, uses=3]")?.id === "com.brave.Browser" && !parseAppLine("header"), "list_apps lines parse");
 }
 
@@ -160,6 +166,8 @@ createInterface({ input: process.stdin }).on("line", (l) => {
   const v0 = migrateConfig({ host: "1.2.3.4", allowApps: ["com.brave.Browser", "com.hnc.Discord"], appEngine: "agent-desktop" }, true);
   assert(v0.migrated && v0.cfg.apps.engine === "open-computer-use" && v0.cfg.apps.allow.length === 2 && v0.cfg.tabs.browser === "brave" && !("allowApps" in v0.cfg), "0.x configs migrate: Brave in allowApps turns tabs on");
   assert(migrateConfig({ allowApps: ["com.google.Chrome"] }, false).cfg.apps.engine === "off", "0.x Linux configs migrate to tabs only");
+  const off = migrateConfig({ allowApps: ["com.brave.Browser"], appEngine: "off" }, true).cfg;
+  assert(off.apps.engine === "off" && off.tabs.browser === "brave", "0.x appEngine off stays off: tabs without app control");
   const v1 = migrateConfig({ apps: { engine: "agent-desktop", allow: ["com.hnc.Discord"], engineFor: { "a.b": "open-computer-use" } }, tabs: { engine: "open-browser-use" }, treeMaxChars: 0, tabEval: false, obuCursor: false, adMaxDepth: 9, idleMinutes: 5 }, true);
   assert(v1.migrated && same(v1.cfg.apps, { engine: "open-computer-use", allow: ["com.hnc.Discord"] }) && !("treeMaxChars" in v1.cfg) && !("adMaxDepth" in v1.cfg) && v1.cfg.idleMinutes === 5, "1.x: agent-desktop and engineFor go, removed settings are dropped, the rest stays");
   assert(!migrateConfig({ apps: { engine: "off" }, tabs: { engine: "open-browser-use" } }, true).migrated, "2.0 configs are left alone");

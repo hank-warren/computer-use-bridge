@@ -104,15 +104,17 @@ export class Session {
     return [...(await this.loadCatalog()).values()].map((e) => e.tool);
   }
 
-  // An allowed bundle ID for app (a bundle ID or an app name), else BadInput.
+  // An allowed bundle ID for app (a bundle ID or an app name), else BadInput. Only a bundle ID
+  // listed in apps.allow skips the lookup; anything else (and everything under --approve-all) must
+  // resolve to a bundle ID through list_apps, so hard-deny is checked on the ID.
   async resolveApp(app) {
     if (typeof app !== "string" || !app.trim() || app.length > 200) throw new BadInput("app must be a bundle ID or app name");
-    if (this.cfg.isAllowed(app)) return this.cfg.canonicalId(app);
-    // An exact name, else the only app whose name starts with it ("Brave" for "Brave Browser").
+    if (this.cfg.listed(app)) return this.cfg.canonicalId(app);
+    // A bundle ID, an exact name, else the only app whose name starts with it ("Brave" for "Brave Browser").
     const apps = await this.apps();
     const want = app.trim().toLowerCase();
     const starts = apps.filter((x) => x.name.toLowerCase().startsWith(want));
-    const id = (apps.find((x) => x.name.toLowerCase() === want) ?? (starts.length === 1 ? starts[0] : null))?.id;
+    const id = (apps.find((x) => x.id.toLowerCase() === want) ?? apps.find((x) => x.name.toLowerCase() === want) ?? (starts.length === 1 ? starts[0] : null))?.id;
     if (id && this.cfg.isAllowed(id)) return this.cfg.canonicalId(id);
     throw new BadInput(`app not allowed: ${app}${id ? ` (${id})` : ""}. Allowed: ${this.cfg.allowApps.join(", ") || "(none)"}`);
   }
