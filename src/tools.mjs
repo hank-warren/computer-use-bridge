@@ -24,7 +24,7 @@ export const ACTIONS = {
     description: "Click an element (preferred) or coordinates [x, y] from the latest screenshot.",
     props: { element: elementProp, ...xyProps, button: { type: "string", enum: ["left", "right", "middle"] }, count: { type: "integer", minimum: 1, maximum: 3 } },
   },
-  type_text: { description: "Type text into the focused element.", props: { text: { type: "string" } }, required: ["text"] },
+  type_text: { description: "Type text into the focused text field. In an app with none focused (a calculator, a game), letters, digits, space, Return, Tab and + - * / = . are pressed as keys.", props: { text: { type: "string" } }, required: ["text"] },
   press_key: {
     description: "Press a key or combination, xdotool syntax: Return, Tab, Escape, Up, super+a (Cmd+A), shift+Tab. In a tab, hold: down keeps the key pressed (games, e.g. Up to accelerate) until press_key with hold: up or release.",
     props: { key: { type: "string" }, hold: { type: "string", enum: ["down", "up"], description: "Tabs only: down presses and holds the key; up lets it go. Omit to press and release." } },
@@ -101,7 +101,7 @@ export const TOOL_DEFS = [
   })),
   {
     name: "batch",
-    description: "Run up to 25 actions in order in one call (click, type_text, press_key, set_value, scroll, drag, secondary_action, or wait with ms), then return the tree once. Stops at the first failing step. Element numbers are from the tree before the batch, so prefer coordinates or stable elements for later steps.",
+    description: "Run up to 25 actions in order in one call (click, type_text, press_key, set_value, scroll, drag, secondary_action, or wait with ms), then return the tree once. Stops at the first failing step. Element numbers are from the tree before the batch and follow their elements as the window changes; a step whose element changed or vanished stops the batch.",
     props: {
       app: appProp, tab: tabProp,
       actions: { type: "array", minItems: 1, maxItems: 25, items: { type: "object", properties: batchItemProps, required: ["action"], additionalProperties: false } },

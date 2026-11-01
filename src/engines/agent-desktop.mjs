@@ -75,12 +75,17 @@ export function adTree(data) {
   if (data.tree) walk(data.tree, 0);
   if (data.complete === false) lines.push("[Partial tree: the app was slow to answer; call get_state again for more.]");
   if (focused !== null) lines.push(`The focused UI element is ${focused}.`);
-  return { text: lines.join("\n"), refs, focused };
+  return { text: lines.join("\n"), refs, focused, window: data.window?.id ?? null };
 }
 
+// agent-desktop finds windows by what is on screen: one on another desktop (Space) is invisible to it.
+const AD_HINTS = {
+  WINDOW_NOT_FOUND: "agent-desktop sees only windows on the current desktop (Space) and minimized ones: bring the window to the desktop in use, or route this app to open-computer-use (apps.engineFor in the config)",
+};
 export class AdError extends Error {
   constructor(e) {
-    super(`${e.code ?? "ERROR"}: ${e.message ?? "agent-desktop failed"}${e.suggestion ? ` (${e.suggestion})` : ""}`);
+    const hint = AD_HINTS[e.code] && !/^No window with id|was not found$/.test(e.message ?? "") ? AD_HINTS[e.code] : e.suggestion;
+    super(`${e.code ?? "ERROR"}: ${e.message ?? "agent-desktop failed"}${hint ? ` (${hint})` : ""}`);
     this.code = e.code;
   }
 }
@@ -97,6 +102,7 @@ export class AdEngine {
     this.adSession = `cub-${randomUUID().slice(0, 8)}`;
     this.trees = new Map(); // app id -> { refs, focused } of the latest tree the client saw
     this.stale = new Set(); // app ids acted on since that tree (quiet batch steps)
+    this.windows = new Map(); // app id -> window id for screenshots taken without a tree
     this.names = new Map(); // bundle id (lowercase) -> display name
     this.queue = Promise.resolve();
   }
@@ -153,8 +159,22 @@ export class AdEngine {
     return t.text;
   }
 
+  // The window of the latest tree (an app can have several, some off screen); read afresh when
+  // there is none, or that window has gone.
   async image(id) {
-    const d = await this.run(["screenshot", "--app", await this.appName(id)]);
+    const shot = async (win) => this.run(["screenshot", "--app", await this.appName(id), "--window-id", String(win)]);
+    let win = this.trees.get(id)?.window ?? this.windows.get(id);
+    let d;
+    try {
+      if (!win) throw new AdError({ code: "WINDOW_NOT_FOUND", message: "No window with id" });
+      d = await shot(win);
+    } catch (e) {
+      if (!(e instanceof AdError) || e.code !== "WINDOW_NOT_FOUND") throw e;
+      win = (await this.read(id)).window;
+      if (!win) throw new AdError({ code: "WINDOW_NOT_FOUND", message: `no window of ${id} to capture` });
+      this.windows.set(id, win);
+      d = await shot(win);
+    }
     return { type: "image", mimeType: `image/${d.format ?? "png"}`, data: d.data };
   }
 

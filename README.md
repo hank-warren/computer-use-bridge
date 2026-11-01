@@ -103,8 +103,9 @@ Configs from 0.x (`allowApps`, `appEngine`) still load; `setup` converts them.
   and sends keys to background windows, so it handles apps with little accessibility (games).
 - **agent-desktop** acts through accessibility only, without focus or cursor movement. Its element
   references belong to one snapshot, so a list that changed returns `STALE_REF` instead of a click
-  on whatever moved into place. It cannot click coordinates, double-click or drag, and
-  `type_text` types into the focused element. **Permissions:** it has no app of its own, so macOS
+  on whatever moved into place. It cannot click coordinates, double-click or drag,
+  `type_text` types into the focused element only, and it sees only windows on the current desktop
+  (Space) and minimized ones. **Permissions:** it has no app of its own, so macOS
   checks the app that launched it: for the service, the `node` running the bridge. Granting
   Accessibility to `node` covers every program that `node` runs, and Homebrew's ad-hoc signed
   `node` loses the grant on each upgrade. To try it, run a second server from a terminal that
@@ -117,8 +118,12 @@ Configs from 0.x (`allowApps`, `appEngine`) still load; `setup` converts them.
 - `get_state(app)` returns the app's window as an accessibility tree with numbered elements.
   `launch_app` starts an allowed app in the background; `list_apps` lists the allowed ones.
 - `click`, `set_value`, `scroll` and `secondary_action` act on element numbers; `screenshot` gives
-  coordinates for `click` and `drag`. Actions return the window's new tree.
-- `type_text` and `press_key` (xdotool syntax: `Return`, `super+a`).
+  coordinates for `click` and `drag`. Actions return the window's new tree. An element number keeps
+  pointing at its element as the window changes; if that element changed or is gone, the action is
+  refused and the current tree returned, rather than clicking whatever took its place.
+- `type_text` types into the focused text field; with none focused (a calculator, a game), letters,
+  digits, space, Return, Tab and `+ - * / = .` are pressed as keys. `press_key` takes xdotool
+  syntax: `Return`, `super+a`.
 - `batch` runs up to 25 actions in one call.
 
 **Browser tabs**
@@ -144,7 +149,8 @@ of it. Screenshots are scaled to 1280 px wide.
 
 ### Limits
 
-- Reading an app whose window is minimized or on another Space brings that app to the front.
+- open-computer-use brings an app to the front to read a window that is minimized or on another
+  desktop (Space); agent-desktop cannot see such a window at all.
 - In apps, `scroll` needs an element, and some lists ignore it (Discord's conversation list).
 - Agent input goes to the same windows you use, so your input and the agent's can interleave.
 - Tabs render in the background, but real-time games need their tab in front to run at full speed.
@@ -216,11 +222,14 @@ working.
 
 ```bash
 npm test                                   # engine-free tests (CI runs them on macOS and Linux)
+node dev/live-test.mjs -- node bin/computer-use-bridge.mjs stdio --config ./config.json
 node dev/mcp-call.mjs --list '[]' -- node bin/computer-use-bridge.mjs stdio --config ./config.json
 ```
 
-`dev/mcp-call.mjs` is a small MCP client for exercising a server over stdio, for example over SSH
-on the machine under test. [AGENTS.md](AGENTS.md) has the layout, conventions and release steps.
+`dev/live-test.mjs` runs every tool against real engines (Calculator for apps, example.com and
+httpbin.org for tabs; the config must allow `com.apple.calculator`). `dev/mcp-call.mjs` is a small
+MCP client for calling a server by hand. Both work over SSH on the machine under test.
+[AGENTS.md](AGENTS.md) has the layout, conventions and release steps.
 
 ## License
 
