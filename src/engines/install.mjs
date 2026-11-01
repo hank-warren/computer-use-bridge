@@ -8,7 +8,7 @@ import { findObu, findOcu, obuChild } from "./native.mjs";
 // The engine versions this release is tested with. setup installs these; status warns when the
 // installed version differs.
 export const ENGINES = {
-  "open-computer-use": { pin: "1.1.2", find: findOcu, repo: "https://github.com/iFurySt/open-computer-use" },
+  "open-computer-use": { pin: "1.1.3", find: findOcu, repo: "https://github.com/iFurySt/open-computer-use" },
   "open-browser-use": { pin: "1.1.0", find: findObu, repo: "https://github.com/iFurySt/open-browser-use" },
 };
 

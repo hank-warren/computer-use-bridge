@@ -150,9 +150,14 @@ edit it and restart the service (`computer-use-bridge setup --yes` rewrites and 
 | `ocuCommand`, `obuCommand` | Engine paths, if they are not on the service's `PATH`. |
 | `obuSocket` | open-browser-use socket to use when several browsers run its extension (`ls /tmp/open-browser-use`). |
 
-The engines have their own settings too. For example, open-computer-use's screenshot format and
-size: `ocu config set image.format jpg` (see its
+The engines have their own settings too, set on the server with their own commands (see
+open-computer-use's
 [configuration](https://github.com/iFurySt/open-computer-use/blob/main/docs/configuration.md)).
+For example, `ocu config set image.format jpg` for smaller screenshots, or
+`ocu config set virtualDisplay.enabled true` to offer `get_app_state`'s
+`window_placement: agent_display`, which works in covered or other-Space windows on an invisible
+display without taking your focus (off by default; it adds a display to the arrangement while in
+use). Each new client session starts the engines afresh, so reload agents after changing them.
 
 Older configs still load; `setup` converts them: 0.x `allowApps`, and 1.x `agent-desktop` and the
 settings of 1.x's own tools, which are dropped.
@@ -163,8 +168,8 @@ Each client session gets its own `open-computer-use mcp` and `open-browser-use m
 the server, and the client sees their tools, descriptions and server instructions exactly as the
 engines publish them:
 
-- **open-computer-use** (macOS): `list_apps`, `get_app_state`, `click`, `type_text`, `press_key`,
-  `scroll`, `set_value`, `drag`, `perform_secondary_action`, `query`.
+- **open-computer-use** (macOS): `list_apps`, `get_app_state`, `click`, `type_text`, `select_text`,
+  `press_key`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `query`.
 - **open-browser-use**: `open_tab`, `navigate`, `wait_load`, `page_info`, `cdp`, `run_action_plan`,
   `tabs`, `user_tabs`, `claim_tab`, `history`, `finalize_tabs`, `name_session`, `turn_ended`, file
   chooser tools, `move_mouse`, `call`, `ping`, `info`.
