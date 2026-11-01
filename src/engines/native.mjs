@@ -15,7 +15,8 @@ export const ocuChild = (cfg, label) => new McpChild({
   name: "open-computer-use",
   command: findOcu(cfg),
   args: ["mcp"],
-  env: { OPEN_COMPUTER_USE_VISUAL_CURSOR: cfg.ocuVisualCursor === true ? "1" : "0" },
+  // Only an explicit setting overrides the engine's own default (its cursor is on).
+  env: typeof cfg.ocuVisualCursor === "boolean" ? { OPEN_COMPUTER_USE_VISUAL_CURSOR: cfg.ocuVisualCursor ? "1" : "0" } : {},
   label,
   missing: 'open-computer-use not found; run "computer-use-bridge setup" or set ocuCommand in the config',
 });

@@ -113,7 +113,8 @@ function fakeEngines() {
   const b = new Session(macConfig({ tabs: { engine: "open-browser-use" } }), "b");
   const argsA = obuChild({ obuSocket: "~/s.sock" }, "a", a.obuSession).args;
   assert(a.obuSession !== b.obuSession && same(argsA.slice(0, 3), ["mcp", "--session-id", a.obuSession]) && argsA[3] === "--socket" && !argsA[4].includes("~"), "each session has its own open-browser-use session; obuSocket is passed on");
-  assert(ocuChild({ ocuVisualCursor: true }, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "1" && ocuChild({}, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "0", "ocuVisualCursor sets the engine's own variable");
+  assert(ocuChild({ ocuVisualCursor: true }, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "1" && ocuChild({ ocuVisualCursor: false }, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "0", "an explicit ocuVisualCursor sets the engine's own variable");
+  assert(!("OPEN_COMPUTER_USE_VISUAL_CURSOR" in ocuChild({}, "x").env), "without ocuVisualCursor the engine keeps its own default (cursor on)");
   for (const s of [t, broken, idle, a, b]) await s.close();
   // Closed while an engine starts (HTTP eviction): the engine is stopped, and nothing starts later.
   let release;
