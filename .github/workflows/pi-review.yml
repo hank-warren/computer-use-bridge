@@ -1,0 +1,36 @@
+name: Pi Code Review
+
+# One approve-or-request-changes review per push from hank-warren/pi-action's
+# pr-review sub-action (cpa/gpt-6.1-sol, falling back to cpa/claude-opus-5-5),
+# posted as github-actions[bot]. Older Pi reviews are collapsed. Repo guidance:
+# .github/pi/review.md.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pi-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pi-review:
+    # Same-repo, human-authored PRs only: forks get no secrets, and bots are skipped.
+    if: >-
+      github.event.pull_request.user.type != 'Bot' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: hank-warren/pi-action/pr-review@v1
+        with:
+          cliproxyapi-api-key: ${{ secrets.CLIPROXYAPI_API_KEY }}
+          cliproxyapi-base-url: ${{ vars.CLIPROXYAPI_BASE_URL }}
