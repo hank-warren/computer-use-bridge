@@ -358,6 +358,7 @@ switch (args[0]) {
   const rows = (pre) => [...pre, "\t1 row", "\t2 row"].join("\n");
   assert(ocuRemap(rows([]), rows(["\t0 group"]).replace(/\t1 row\n\t2 row/, "\t1 group\n\t2 row\n\t3 row"), 2).index === 3, "identical elements keep their order");
   assert(/several/.test(ocuRemap(rows([]), "\t0 row\n\t1 row\n\t2 row", 1).error), "a duplicate whose count changed is ambiguous");
+  assert(/several alike/.test(ocuRemap("\t0 button Delete\n\t1 button Delete", "\t0 button Delete", 1).error), "two identical elements becoming one is refused, not redirected");
 
   const c = new OcuChild({}, "t");
   const sent = [];

@@ -43,15 +43,16 @@ export function ocuRemap(from, to, n) {
   if (!e) return { error: `element ${n} is not in the latest tree` };
   if (from === to) return { index: n };
   const now = ocuElements(to);
+  // Only when as many such elements remain: with two identical buttons and one left, which one
+  // survived is unknowable.
   const pick = (same) => {
     const before = was.filter(same);
     const after = now.filter(same);
-    if (after.length === 1) return after[0].n;
-    if (after.length > 1 && after.length === before.length) return after[before.indexOf(e)].n;
-    return after.length > 1 ? null : undefined;
+    if (!after.length) return undefined;
+    return after.length === before.length ? after[before.indexOf(e)].n : null;
   };
   const found = pick((x) => x.depth === e.depth && x.key === e.key) ?? pick((x) => x.key === e.key);
-  if (found === null) return { error: `element ${n} (${short(e.line)}) now matches several elements` };
+  if (found === null) return { error: `element ${n} (${short(e.line)}) is one of several alike whose number changed` };
   if (found === undefined) return { error: `element ${n} (${short(e.line)}) changed or is gone` };
   return { index: found };
 }
