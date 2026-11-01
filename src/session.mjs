@@ -247,13 +247,11 @@ export class Session {
       case "read_tab": {
         const max = a.max_chars === undefined ? 20_000 : int(a.max_chars, "max_chars");
         const format = a.format ?? "text";
-        let text;
-        if (format === "dom") text = await b.eval(tab, "document.documentElement.outerHTML");
-        else if (format === "text") {
-          const sel = opt(a.selector, "selector", 2000);
-          text = await b.eval(tab, `(() => { const e = ${sel ? `document.querySelector(${J(sel)})` : "document.body"}; return e ? e.innerText : null; })()`);
-          if (text === null) throw new BadInput(`selector ${sel} matched nothing`);
-        } else throw new BadInput("format must be text or dom");
+        if (format !== "dom" && format !== "text") throw new BadInput("format must be text or dom");
+        const sel = opt(a.selector, "selector", 2000);
+        const root = sel ? `document.querySelector(${J(sel)})` : format === "dom" ? "document.documentElement" : "document.body";
+        const text = await b.eval(tab, `(() => { const e = ${root}; return e ? e.${format === "dom" ? "outerHTML" : "innerText"} : null; })()`);
+        if (text === null) throw new BadInput(`selector ${sel} matched nothing`);
         return textResult(trunc(String(text ?? ""), max));
       }
       case "eval_tab": {

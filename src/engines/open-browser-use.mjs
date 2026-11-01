@@ -63,6 +63,11 @@ export const CDP_KEYS = {
   Left: ["ArrowLeft", "ArrowLeft", 37], Right: ["ArrowRight", "ArrowRight", 39], Home: ["Home", "Home", 36],
   End: ["End", "End", 35], Page_Up: ["PageUp", "PageUp", 33], Page_Down: ["PageDown", "PageDown", 34],
   Insert: ["Insert", "Insert", 45],
+  // Modifiers on their own, e.g. to hold Shift in a game.
+  shift: ["Shift", "ShiftLeft", 16, undefined, 8], Shift_L: ["Shift", "ShiftLeft", 16, undefined, 8], Shift_R: ["Shift", "ShiftRight", 16, undefined, 8],
+  ctrl: ["Control", "ControlLeft", 17, undefined, 2], Control_L: ["Control", "ControlLeft", 17, undefined, 2], Control_R: ["Control", "ControlRight", 17, undefined, 2],
+  alt: ["Alt", "AltLeft", 18, undefined, 1], Alt_L: ["Alt", "AltLeft", 18, undefined, 1], Alt_R: ["Alt", "AltRight", 18, undefined, 1],
+  super: ["Meta", "MetaLeft", 91, undefined, 4], Super_L: ["Meta", "MetaLeft", 91, undefined, 4], Super_R: ["Meta", "MetaRight", 92, undefined, 4],
   ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, [`F${i + 1}`, `F${i + 1}`, 112 + i]])),
 };
 export const CDP_MODIFIERS = { alt: 1, option: 1, ctrl: 2, control: 2, super: 4, cmd: 4, meta: 4, shift: 8 };
@@ -78,8 +83,8 @@ export function cdpKey(spec) {
     if (!bit) throw new BadInput(`unknown modifier ${m}`);
     modifiers |= bit;
   }
-  let key, code, keyCode, text;
-  if (CDP_KEYS[name]) [key, code, keyCode, text] = CDP_KEYS[name];
+  let key, code, keyCode, text, own;
+  if (CDP_KEYS[name]) [key, code, keyCode, text, own] = CDP_KEYS[name];
   else if (name.length === 1) {
     const upper = name.toUpperCase();
     key = modifiers & 8 && /[a-z]/.test(name) ? upper : name;
@@ -87,6 +92,7 @@ export function cdpKey(spec) {
     keyCode = upper.charCodeAt(0);
     text = key;
   } else throw new BadInput(`unknown key ${name}`);
+  modifiers |= own ?? 0;
   if (modifiers & (1 | 2 | 4)) text = undefined;
   const command = modifiers === 4 && CDP_COMMANDS[name.toLowerCase()];
   const redo = modifiers === (4 | 8) && name.toLowerCase() === "z";
@@ -395,6 +401,7 @@ export class ObuBrowser {
 
   async setValue(tab, backendNodeId, value) {
     await this.call(tab, backendNodeId, `function (v) {
+  if (this.nodeType !== 1 || !(/^(INPUT|TEXTAREA|SELECT)$/.test(this.tagName) || this.isContentEditable || (this.tagName.includes("-") && "value" in this))) throw new Error("not a field");
   this.focus();
   if (this.isContentEditable) this.textContent = v;
   else {
@@ -403,7 +410,9 @@ export class ObuBrowser {
   }
   this.dispatchEvent(new Event("input", { bubbles: true }));
   this.dispatchEvent(new Event("change", { bubbles: true }));
-}`, [value]);
+}`, [value]).catch((e) => {
+      throw /\bError: not a field\b/.test(e.message) ? new BadInput("that element does not take a value; give a text field, text area, select or editable element") : e;
+    });
   }
 
   // Scrolls in page JS: wheel events wait on frames that a background tab does not draw.

@@ -11,9 +11,10 @@ import { configPath, migrateConfig, normalizeConfig, parseArgs } from "../src/co
 import { plist, stableNode, unit, versionedNode } from "../src/service.mjs";
 import { remoteCommand } from "../src/connect.mjs";
 import { execFileSync } from "node:child_process";
-import { adKey, adTree } from "../src/engines/agent-desktop.mjs";
+import { AdError, adKey, adSecondary, adTree } from "../src/engines/agent-desktop.mjs";
 import { adPermissions, ocuPermissions } from "../src/engines/install.mjs";
 import { ObuBrowser, cdpKey, pwKey } from "../src/engines/open-browser-use.mjs";
+import { OcuChild, ocuKey, ocuRemap, ocuTypeKeys } from "../src/engines/open-computer-use.mjs";
 import { toolDefs, toolSchema } from "../src/tools.mjs";
 
 const assert = (c, m) => { if (!c) { console.log("FAIL", m); process.exitCode = 1; } else console.log("ok  ", m); };
@@ -248,13 +249,13 @@ switch (args[0]) {
   case "version": ok({ version: "9.9.9" });
   case "list-apps": ok({ apps: [{ name: "Discord", pid: 1, bundle_id: "com.hnc.Discord", presentation: "foreground" }, { name: "Terminal", pid: 2, bundle_id: "com.apple.Terminal", presentation: "foreground" }, { name: "Helper", pid: 3, bundle_id: "x.helper" }] });
   case "snapshot": { const m = fs.existsSync(${JSON.stringify(moved)}); const id = m ? "s2" : "s1"; const r = (n) => "@" + id + ":e" + n;
-    ok({ app: "Discord", window: { title: "general" }, snapshot_id: id, complete: true, tree: { role: "window", name: "general", children: [
+    ok({ app: "Discord", window: { title: "general", id: "w1" }, snapshot_id: id, complete: true, tree: { role: "window", name: "general", children: [
     { role: "statictext", name: "hello\\nthere" },
     { ref_id: r(1), role: "button", name: "Send", states: ["enabled"], available_actions: ["Click"] },
     { ref_id: r(2), role: "textfield", name: "Message", value: "hi", states: m ? [] : ["focused"], available_actions: ["Click", "Focus"] },
     { ref_id: r(3), role: "disclosure", name: "Channels", available_actions: ["Expand"], children_count: 4 },
     { ref_id: r(4), role: "textfield", name: "Search", states: m ? ["focused"] : [] } ] } }); }
-  case "screenshot": ok({ data: "iVBOR", format: "png", width: 10, height: 10 });
+  case "screenshot": if (args.includes("gone")) err("WINDOW_NOT_FOUND", "Window 'gone' was not found"); ok({ data: "iVBOR", format: "png", width: 10, height: 10 });
   case "click": if (args[1] === "@s1:e3") err("STALE_REF", "ref no longer matches"); if (args[1] === "@s1:e4") fs.writeFileSync(${JSON.stringify(moved)}, ""); ok({ disposition: { delivery: "delivered_verified", retry: "unsafe" } });
   default: ok({ disposition: { delivery: "delivered_unverified" } });
 }
@@ -304,7 +305,11 @@ switch (args[0]) {
     assert(!b.isError && bs.join(",") === "click,press,click,snapshot", "a batch reads the tree once, after its last step");
     clear();
     const shot = await s.callTool("screenshot", { app: "com.hnc.Discord" });
-    assert(shot.content[0].type === "image" && read().map((a) => a[0]).join() === "screenshot", "screenshot without a tree");
+    assert(shot.content[0].type === "image" && read().map((a) => a.join(" ")).join() === "screenshot --app Discord --window-id w1", "screenshot of the latest tree's window, without a tree");
+    clear();
+    s.engines.get("agent-desktop").trees.get("com.hnc.Discord").window = "gone";
+    const again = await s.callTool("screenshot", { app: "com.hnc.Discord" });
+    assert(!again.isError && read().map((a) => a[0] + (a.includes("--window-id") ? ` ${a.at(-1)}` : "")).join() === "screenshot gone,snapshot,screenshot w1", "a window that has gone is found again for the screenshot");
     clear();
     const gs = await s.callTool("get_state", { app: "com.hnc.Discord", screenshot: true });
     const plain = await s.callTool("get_state", { app: "com.hnc.Discord" });
@@ -321,9 +326,90 @@ switch (args[0]) {
     await s.close();
     assert(read().some((a) => a.join(" ").startsWith("session end cub-")), "the agent-desktop session ends with the bridge session");
     assert(adTree({ app: "X", complete: false, tree: { role: "window" } }).text.includes("Partial tree"), "partial trees are flagged");
+    const listed = adTree({ app: "X", tree: { ref_id: "@s:e1", role: "scrollarea", name: "Edit field", available_actions: ["Click", "Scroll", "SetFocus", "AXShowMenu"] } }).text;
+    assert(/Secondary Actions: SetFocus, AXShowMenu$/m.test(listed) && adSecondary("SetFocus") === "focus" && adSecondary("Scroll") === undefined, "only secondary actions the adapter can perform are listed");
+    const off = new AdError({ code: "WINDOW_NOT_FOUND", message: "Application 'Discord' is running but has no matching window", suggestion: "Wait for the app" });
+    assert(/current desktop \(Space\)/.test(off.message) && /engineFor/.test(off.message), "a window on another desktop is explained");
+    assert(new AdError({ code: "WINDOW_NOT_FOUND", message: "No window with id 7", suggestion: "Run list-windows" }).message.endsWith("(Run list-windows)"), "other window errors keep agent-desktop's suggestion");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+// 4j. open-computer-use renumbers elements on every call: numbers from the tree the client saw are
+// mapped to the engine's latest tree (batch steps, screenshots), or refused when the element changed.
+{
+  const A = [
+    "App=com.apple.calculator (pid 1)", 'Window: "Calculator", App: Calculator.',
+    "0 standard window Calculator ID: main, Secondary Actions: Raise",
+    "\t1 container ID: CalculatorKeypadView",
+    "\t\t2 scroll area Description: Last Expression ID: LastExpression, Secondary Actions: Scroll Up",
+    "\t\t\t3 text 2+2",
+    "\t\t4 scroll area Description: Edit field ID: StandardInputView, Secondary Actions: Scroll Up, Scroll Down, Copy",
+    "\t\t\t5 text 4",
+    "\t\t6 button All Clear ID: AllClear",
+    "\t\t7 button 6 ID: Six",
+    "\t\t8 button Multiply ID: Multiply",
+    "The focused UI element is 4.",
+  ].join("\n");
+  const B = A.replace(/\t\t2 scroll area[^\n]*\n\t\t\t3 text 2\+2\n/, "").replace(/^(\t*)(\d+) /gm, (m, t, n) => `${t}${Number(n) > 3 ? Number(n) - 2 : n} `).replace("text 4", "text 0");
+  assert(ocuRemap(A, B, 7).index === 5 && ocuRemap(A, B, 8).index === 6 && ocuRemap(A, A, 7).index === 7, "elements are found again after the tree shifts");
+  assert(/2\+2\) changed or is gone/.test(ocuRemap(A, B, 3).error) && /not in the latest tree/.test(ocuRemap(A, B, 99).error), "a vanished element is refused, not replaced");
+  assert(ocuKey("checkbox (selected, settable) Bold ID: b, Secondary Actions: Uncheck") === ocuKey("checkbox Bold ID: b, Secondary Actions: Check"), "traits and secondary actions do not change an element's identity");
+  assert(ocuKey("text field Message, Value: hi Placeholder: Say") === ocuKey("text field Message, Value: hello there Placeholder: Say") && ocuKey("button Go Frame: {1, 2}") === ocuKey("button Go Frame: {5, 6}"), "nor do values and frames");
+  const rows = (pre) => [...pre, "\t1 row", "\t2 row"].join("\n");
+  assert(ocuRemap(rows([]), rows(["\t0 group"]).replace(/\t1 row\n\t2 row/, "\t1 group\n\t2 row\n\t3 row"), 2).index === 3, "identical elements keep their order");
+  assert(/several/.test(ocuRemap(rows([]), "\t0 row\n\t1 row\n\t2 row", 1).error), "a duplicate whose count changed is ambiguous");
+  assert(/several alike/.test(ocuRemap("\t0 button Delete\n\t1 button Delete", "\t0 button Delete", 1).error), "two identical elements becoming one is refused, not redirected");
+
+  const c = new OcuChild({}, "t");
+  const sent = [];
+  const replies = [];
+  c.request = async (method, params) => { sent.push(params); return replies.shift(); };
+  const tree = (t) => ({ content: [{ type: "text", text: t }] });
+  replies.push(tree(A));
+  await c.call("get_app_state", { app: "calc" }, 1000);
+  replies.push(tree(B), tree(B), tree(B));
+  await c.call("click", { app: "calc", element_index: "6" }, 1000, { quiet: true });
+  await c.call("click", { app: "calc", element_index: "7" }, 1000, { quiet: true });
+  await c.call("click", { app: "calc", element_index: "8" }, 1000);
+  assert(sent.slice(1).map((p) => p.arguments.element_index).join() === "6,5,6", "batch steps after a change use the latest numbering");
+  replies.push(tree(B));
+  await c.call("click", { app: "calc", element_index: "5" }, 1000);
+  assert(sent.at(-1).arguments.element_index === "5", "after a tree the client saw, its numbers are used as they are");
+  replies.push({ content: [{ type: "text", text: A }, { type: "image", mimeType: "image/png", data: "" }] });
+  await c.call("get_app_state", { app: "calc", max_tree_nodes: 1 }, 1000);
+  assert(sent.at(-1).arguments.max_tree_nodes === undefined, "a screenshot keeps the engine's whole numbering");
+  replies.push(tree(A));
+  await c.call("click", { app: "calc", element_index: "5" }, 1000);
+  assert(sent.at(-1).arguments.element_index === "7", "numbers from before a screenshot follow the window it showed");
+  c.shown.set("calc", A);
+  c.latest.set("calc", B);
+  const n = sent.length;
+  const gone = await c.call("click", { app: "calc", element_index: "3" }, 1000);
+  assert(gone.isError && sent.length === n && /nothing was done/.test(gone.content[0].text) && gone.content[1].text === B && c.shown.get("calc") === B, "a changed element is refused with the window as it is now");
+  const unknown = await c.call("click", { app: "calc", element_index: "99" }, 1000);
+  assert(unknown.isError && sent.length === n && /not in your latest tree/.test(text(unknown)), "a number the client never saw is refused without calling the engine");
+  const refuse = { isError: true, content: [{ type: "text", text: "type_text requires a focused editable text element. Click a text entry area first." }] };
+  replies.push(refuse, ...Array(5).fill(tree(B)));
+  const before = sent.length;
+  const typed = await c.call("type_text", { app: "calc", text: "1A+3=" }, 1000);
+  assert(!typed.isError && sent.slice(before + 1).map((p) => `${p.name}:${p.arguments.key}`).join() === "press_key:1,press_key:shift+a,press_key:kp_add,press_key:3,press_key:kp_equal" && /pressed key by key/.test(typed.content[0].text), "type_text without a focused field presses the keys");
+  replies.push(refuse);
+  const odd = await c.call("type_text", { app: "calc", text: "a,b" }, 1000);
+  assert(odd.isError && /use press_key/.test(text(odd)), "text with keys open-computer-use cannot name is refused with a hint");
+  assert(ocuTypeKeys("") === null && ocuTypeKeys("x".repeat(201)) === null && ocuTypeKeys("Hi 2\n").join() === "shift+h,i,space,2,return", "typing keys: limits and names");
+
+  const s = new Session(config(["com.apple.calculator"]), "t");
+  s.apps = async () => [{ id: "com.apple.calculator", displayName: "Calculator" }];
+  const e = new OcuChild({}, "t");
+  const got = [];
+  const answers = [tree(A), tree(B), tree(B), tree(B)];
+  e.request = async (method, params) => { got.push(params.arguments.element_index); return answers.shift(); };
+  s.cua = async () => e;
+  await s.callTool("get_state", { app: "Calculator" });
+  const b = await s.callTool("batch", { app: "Calculator", actions: [6, 7, 8].map((element) => ({ action: "click", element })) });
+  assert(!b.isError && got.slice(1).join() === "6,5,6" && text(b).includes("8 button Multiply") === false && text(b).includes("6 button Multiply"), "a batch clicks what the client saw, and returns the latest tree");
 }
 
 // 4h. CLI arguments, service files and the remote command connect runs.
@@ -413,6 +499,16 @@ switch (args[0]) {
     : {}));
   const r = await s.callTool("eval_tab", { tab: "5", expression: "document.title = 'x'" });
   assert(r.isError && /read-only/.test(text(r)), "side effects are refused as read-only");
+  const exprs = [];
+  s.obu = fakeBrowser(cfg, [5], async (m, p) => {
+    if (m === "Runtime.evaluate") exprs.push(p.expression);
+    return m === "Runtime.evaluate" ? { result: { value: "<h1>x</h1>" } } : m === "DOM.resolveNode" ? { object: { objectId: "o1" } } : m === "Runtime.callFunctionOn" ? { exceptionDetails: { exception: { description: "Error: not a field\n    at Text.<anonymous>" } } } : {};
+  });
+  const dom = await s.callTool("read_tab", { tab: "5", format: "dom", selector: "h1" });
+  assert(!dom.isError && /querySelector\("h1"\)/.test(exprs.at(-1)) && /outerHTML/.test(exprs.at(-1)), "read_tab dom reads the selector's element");
+  s.obu.elements.set(5, new Map([[0, 42]]));
+  const sv = await s.callTool("set_value", { tab: "5", element: 0, value: "x" });
+  assert(sv.isError && /does not take a value/.test(text(sv)) && !/at Text/.test(text(sv)), "set_value on a non-field is refused plainly");
 }
 
 // 7. Keys for CDP.
@@ -424,6 +520,8 @@ switch (args[0]) {
   let threw = false;
   try { cdpKey("hyper+a"); } catch { threw = true; }
   assert(threw, "an unknown modifier is refused");
+  const sh = cdpKey("shift");
+  assert(sh.key === "Shift" && sh.code === "ShiftLeft" && sh.modifiers === 8 && !sh.text && cdpKey("Control_L").modifiers === 2 && cdpKey("super").key === "Meta", "modifiers work as keys on their own (held in games)");
   assert(pwKey("Control+A") === "ctrl+A" && pwKey("Enter") === "Return" && pwKey("Shift+ArrowDown") === "shift+Down", "Playwright key names map to xdotool");
 }
 

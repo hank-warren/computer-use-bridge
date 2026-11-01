@@ -59,6 +59,7 @@ Then the user reloads pi. Rules while doing this:
 | `src/service.mjs` | LaunchAgent (macOS) and systemd user unit (Linux). |
 | `src/setup.mjs`, `src/connect.mjs` | `setup`, `status`, `update`; `connect` and `client-info`. |
 | `dev/logic-test.mjs` | Engine-free tests with fake engines; `npm test`. CI runs it on macOS and Linux. |
+| `dev/live-test.mjs` | Every tool against real engines over stdio or HTTP: Calculator for apps, public pages for tabs. |
 | `dev/mcp-call.mjs` | Small MCP client for driving a server over stdio by hand. |
 
 - **The security boundary is the product.** `HARD_DENY` (in `src/common.mjs`) and `apps.allow`
@@ -66,13 +67,18 @@ Then the user reloads pi. Rules while doing this:
   constant-time; clients never send code. `.github/pi/review.md` lists what review blocks on.
 - **Engine output contracts.** Changing how engine output is parsed (`list_apps` lines,
   `doctor --json`, trees and their focus line, agent-desktop envelopes, open-browser-use messages)
-  needs a test in `dev/logic-test.mjs`. Bump an `ENGINES` pin only after checking the new version's
-  output.
+  needs a test in `dev/logic-test.mjs`. Bump an `ENGINES` pin only after `dev/live-test.mjs`
+  passes against the new version.
+- **Element numbers belong to the tree the client saw.** open-computer-use renumbers on every call,
+  so its adapter maps numbers to the engine's latest tree (`ocuRemap`) and refuses an element that
+  changed; agent-desktop's refs and tab DOM nodes stay put by themselves.
 - **Config compatibility.** Older config files must keep loading: extend `migrateConfig`.
 - **Live tests never touch the user's running service.** `npm pack`, copy the tarball to the
   target, `npm i -g --prefix /tmp/cubtest <tgz>`, then `setup --yes --no-service --config
-  /tmp/cubtest/config.json --port 47899` and `dev/mcp-call.mjs` over SSH against
-  `.../bin/computer-use-bridge.mjs stdio --config /tmp/cubtest/config.json`. Clean up afterwards.
+  /tmp/cubtest/config.json --port 47899` and `dev/live-test.mjs` over SSH against
+  `.../bin/computer-use-bridge.mjs stdio --config /tmp/cubtest/config.json` (allow
+  `com.apple.calculator`). agent-desktop needs a server started from a terminal with Accessibility;
+  test it with `--url` and `--token-file`. Clean up afterwards.
 - **Versions** live only in `package.json`.
 
 ## Releasing
