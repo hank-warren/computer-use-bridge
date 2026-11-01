@@ -114,6 +114,22 @@ function fakeEngines() {
   assert(a.obuSession !== b.obuSession && same(argsA.slice(0, 3), ["mcp", "--session-id", a.obuSession]) && argsA[3] === "--socket" && !argsA[4].includes("~"), "each session has its own open-browser-use session; obuSocket is passed on");
   assert(ocuChild({ ocuVisualCursor: true }, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "1" && ocuChild({}, "x").env.OPEN_COMPUTER_USE_VISUAL_CURSOR === "0", "ocuVisualCursor sets the engine's own variable");
   for (const s of [t, broken, idle, a, b]) await s.close();
+  // Closed while an engine starts (HTTP eviction): the engine is stopped, and nothing starts later.
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const made = [];
+  const slow = new Session(macConfig({ apps: { engine: "open-computer-use", allow: ["com.hnc.Discord"] }, tabs: { engine: "open-browser-use" } }), "t", {
+    start: async (kind) => { const e = { kind, dead: false, tools: [], close: async () => { e.dead = true; } }; made.push(e); await gate; return e; },
+  });
+  const listing = slow.listTools();
+  await Promise.resolve();
+  const closing = slow.close();
+  release();
+  await closing;
+  await listing;
+  assert(made.length === 1 && made[0].dead && slow.engines.size === 0, "an engine that finishes starting after close is stopped, and the other never starts");
+  assert(/closed/.test(text(await slow.callTool("open_tab", {}))) || (await slow.callTool("open_tab", {})).isError, "a closed session starts no engines");
+  assert(made.length === 1, "no engine started after close");
 }
 
 // 4. McpChild speaks MCP to a real child process: initialize, tools, calls, server pings, exits.

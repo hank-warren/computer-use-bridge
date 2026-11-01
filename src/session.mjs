@@ -39,11 +39,20 @@ export class Session {
   }
 
   engine(kind) {
+    if (this.closed) return Promise.reject(new Error("the session is closed"));
     const running = this.engines.get(kind);
     if (running && !running.dead) return Promise.resolve(running);
     if (!this.starting.has(kind)) {
       this.starting.set(kind, this.start(kind)
-        .then((c) => { this.engines.set(kind, c); return c; })
+        .then(async (c) => {
+          // Closed while it started (evicted, idle): stop it rather than leave it running.
+          if (this.closed) {
+            await c.close();
+            throw new Error("the session is closed");
+          }
+          this.engines.set(kind, c);
+          return c;
+        })
         .finally(() => this.starting.delete(kind)));
     }
     return this.starting.get(kind);
@@ -56,9 +65,11 @@ export class Session {
     await Promise.allSettled(running.map((c) => c.close()));
   }
 
-  close() {
+  async close() {
+    this.closed = true;
     clearInterval(this.reaper);
-    return this.stopEngines("closed");
+    await this.stopEngines("closed");
+    await Promise.allSettled([...this.starting.values()]);
   }
 
   // The engines' tools. open-computer-use tools are offered only if they take an app, so a tool
