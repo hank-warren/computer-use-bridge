@@ -1,7 +1,8 @@
 name: release
 
 # Pushing a v* tag on main publishes a GitHub release and the npm package. npm authenticates this
-# workflow through trusted publishing (OIDC), so no npm token is stored; provenance is attached.
+# workflow through trusted publishing (OIDC); provenance is attached. The NPM_TOKEN secret covers
+# the first publish, which trusted publishing cannot do.
 on:
   push:
     tags: ["v*"]
@@ -35,16 +36,20 @@ jobs:
           for f in bin/*.mjs src/*.mjs src/engines/*.mjs; do node --check "$f"; done
           npm test
 
+      # Before the GitHub release, so a failed publish leaves only a tag to delete and push again.
+      - name: Publish to npm
+        env:
+          # Only for publishes trusted publishing cannot do (the first, before the package existed).
+          # Once it is configured npm uses OIDC, and this secret can be deleted.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          v="$(node -p 'require("./package.json").version')"
+          if npm view "computer-use-bridge@$v" version >/dev/null 2>&1; then echo "$v is already on npm"; exit 0; fi
+          # Trusted publishing needs npm 11.5.1 or later.
+          npm i -g npm@^11.5.1
+          npm publish --access public --provenance
+
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes --title "$GITHUB_REF_NAME"
-
-      - name: Publish to npm
-        run: |
-          v="$(node -p 'require("./package.json").version')"
-          # A version published by hand (the first one, before trusted publishing existed) is skipped.
-          if npm view "computer-use-bridge@$v" version >/dev/null 2>&1; then echo "$v is already on npm"; exit 0; fi
-          # Trusted publishing needs npm 11.5.1 or later.
-          npm i -g npm@^11.5.1
-          npm publish --access public
