@@ -18,10 +18,10 @@ jobs:
           node-version: 24
       - name: Syntax, tests and CLI (tabs only)
         run: |
-          node --check computer-use-bridge.mjs
+          for f in bin/*.mjs src/*.mjs src/engines/*.mjs; do node --check "$f"; done
           node dev/logic-test.mjs
-          node computer-use-bridge.mjs --version
-          if node computer-use-bridge.mjs setup --yes; then echo "setup must refuse on Linux" >&2; exit 1; fi
+          node bin/computer-use-bridge.mjs --version
+          npm pack --dry-run
 
   check:
     runs-on: macos-latest
@@ -32,11 +32,10 @@ jobs:
           node-version: 24
       - name: Syntax and CLI
         run: |
-          node --check computer-use-bridge.mjs
-          node --check dev/mcp-call.mjs
+          for f in bin/*.mjs src/*.mjs src/engines/*.mjs dev/*.mjs; do node --check "$f"; done
           node dev/logic-test.mjs
-          node computer-use-bridge.mjs --version
-          node computer-use-bridge.mjs help >/dev/null
+          node bin/computer-use-bridge.mjs --version
+          node bin/computer-use-bridge.mjs help >/dev/null
       - name: Formula style
         env:
           HOMEBREW_NO_AUTO_UPDATE: 1

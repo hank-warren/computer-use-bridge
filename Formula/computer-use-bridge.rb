@@ -1,11 +1,12 @@
-# Updated by .github/workflows/release.yml when a v* tag is pushed.
+# Deprecated: 1.0 moved to npm (npm i -g computer-use-bridge). Kept at 0.6.0 for existing installs.
 class ComputerUseBridge < Formula
   desc "Let MCP clients use your Mac's apps and browser tabs over your tailnet"
   homepage "https://github.com/hank-warren/computer-use-bridge"
   url "https://github.com/hank-warren/computer-use-bridge/archive/refs/tags/v0.6.0.tar.gz"
   sha256 "fba46f4ee3d0967669bc052fe5eadd7314c7f2d7dd6782c8c42bf55fbdce0347"
   license "MIT"
-  head "https://github.com/hank-warren/computer-use-bridge.git", branch: "main"
+
+  deprecate! date: "2026-11-01", because: "moved to npm: npm i -g computer-use-bridge"
 
   depends_on :macos
   depends_on "node"
@@ -20,15 +21,10 @@ class ComputerUseBridge < Formula
 
   def caveats
     <<~EOS
-      Install the engines it drives, then grant open-computer-use its permissions:
-        npm i -g open-computer-use open-browser-use
-        open-computer-use
-      For browser tabs (Brave or Chrome), register the native host and add the extension:
-        open-browser-use install-manifest --browser chrome
-      Configure the server and start it:
+      computer-use-bridge 1.0 and later install with npm, on macOS and Linux:
+        npm i -g computer-use-bridge
         computer-use-bridge setup
-      Upgrade and restart the service in one step:
-        computer-use-bridge update
+      setup converts this install's config, keeps its token and replaces this service.
     EOS
   end
 
