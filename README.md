@@ -14,6 +14,9 @@ Agents get each engine's own MCP tools, unchanged, as if it ran on their machine
 | [open-computer-use](https://github.com/iFurySt/open-computer-use) | Apps, through accessibility plus background clicks and keys; also pixel-only apps such as games | macOS |
 | [open-browser-use](https://github.com/iFurySt/open-browser-use) | Browser tabs, through a browser extension | macOS, Linux |
 
+> **Installed it with Homebrew (0.x)?** It now ships on npm; Homebrew stays at 0.6.0 and
+> `brew upgrade` will not move you forward. See [Upgrading from Homebrew](#upgrading-from-homebrew-0x).
+
 ## Do you need the bridge?
 
 - **Your agent runs on the same Mac (or Linux box) as the apps and browser:** you don't. Use the
@@ -218,16 +221,21 @@ configures pi to run `computer-use-bridge stdio` over SSH.
 tools instead of 1.x's (`get_state` is now `get_app_state`, tabs use `open_tab`, `page_info` and
 `cdp`, and there is no `batch` or `release`), so reload them after updating.
 
-## Upgrading from 0.x (Homebrew)
+## Upgrading from Homebrew (0.x)
+
+The Homebrew formula is deprecated at 0.6.0 (`brew upgrade` stays there); new releases are on npm.
+On the Mac running the server:
 
 ```bash
-npm i -g computer-use-bridge
-computer-use-bridge setup                     # converts the config, keeps the token, replaces the service
+brew list computer-use-bridge                 # shows whether you have the Homebrew install
+npm i -g computer-use-bridge                  # Homebrew's node works; no sudo needed
+computer-use-bridge setup                     # stops the Homebrew service, converts the config, keeps the token
+computer-use-bridge status                    # everything ok?
 brew uninstall computer-use-bridge && brew untap hank-warren/computer-use-bridge
 ```
 
-`setup` stops the Homebrew service (it holds the same port) and keeps your token, so clients keep
-working.
+Keep Homebrew's `node`: the new install runs on it. Clients keep working with the same token and
+address, but the tools changed (see [Upgrading from 1.x](#upgrading-from-1x)), so reload your agent.
 
 ## Uninstalling
 

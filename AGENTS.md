@@ -12,15 +12,17 @@ The README's "Quick start" is the full procedure; follow it. In short:
 1. **Ask first:** where the agent runs, which machine it should control, which apps agents may
    control (macOS bundle IDs, from `osascript -e 'id of app "Slack"'`; never add apps they did not
    name), which browser (`brave` or `chrome`), and which agent client (pi, Claude Code, Codex).
-2. **Same machine?** If the agent runs on the machine it controls, do not install the bridge: set up
+2. **Homebrew install?** If `brew list computer-use-bridge` succeeds, the user has 0.x: follow the
+   README's "Upgrading from Homebrew (0.x)" instead of a fresh install, keeping its token.
+3. **Same machine?** If the agent runs on the machine it controls, do not install the bridge: set up
    the engines directly (README, "Do you need the bridge?").
-3. **Prerequisites** (README, "Before you start"): Node 20+ on both machines (ask before installing
+4. **Prerequisites** (README, "Before you start"): Node 20+ on both machines (ask before installing
    or switching Node), `npm i -g` without sudo (fix `EACCES` with an npm prefix in the home
    directory, never `sudo npm`), the client reaching the server (Tailscale), and SSH key login from
    client to server (on a Mac server, Remote Login). Check SSH with
    `ssh -o BatchMode=yes <server> true` before going on; the user does any step needing a password,
    sudo or a GUI.
-4. **Server:**
+5. **Server:**
 
    ```bash
    npm i -g computer-use-bridge
@@ -37,12 +39,12 @@ The README's "Quick start" is the full procedure; follow it. In short:
      reopen the browser.
    - Linux: `sudo loginctl enable-linger $USER`, so the service survives logout. Ask before using
      sudo.
-5. **Client:** `computer-use-bridge connect <ssh-destination> --name <name>` registers it with pi
+6. **Client:** `computer-use-bridge connect <ssh-destination> --name <name>` registers it with pi
    (without `--name`, the name is the server's hostname). For Claude Code or Codex, use
    `connect <ssh-destination> --name <name> --print`, then the README's `claude mcp add` or
    `codex mcp add` command; for Codex, the token's environment variable must be set where Codex
    starts.
-6. **Verify:** after the user restarts or reloads the agent, call `list_apps` (when apps are on) and
+7. **Verify:** after the user restarts or reloads the agent, call `list_apps` (when apps are on) and
    `ping` (when tabs are on) through the new server.
 
 Rules while doing this:
