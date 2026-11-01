@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session } from "../src/session.mjs";
 import { configPath, migrateConfig, normalizeConfig, parseArgs } from "../src/config.mjs";
-import { plist, stableNode, unit, versionedNode } from "../src/service.mjs";
+import { launchdReload, plist, stableNode, unit, versionedNode } from "../src/service.mjs";
 import { remoteCommand } from "../src/connect.mjs";
 import { execFileSync } from "node:child_process";
 import { AdError, adKey, adSecondary, adTree } from "../src/engines/agent-desktop.mjs";
@@ -432,6 +432,33 @@ switch (args[0]) {
   let out = "";
   try { execFileSync("/bin/sh", ["-c", remoteCommand(["client-info", "--config", "/tmp/it's here.json"])], { env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent" }, stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { out = String(e.stderr); }
   assert(/is not installed there/.test(out), "the remote command runs in sh and reports a missing install");
+}
+
+// 4h2. Reloading the LaunchAgent waits for the old job to unload, retries bootstrap, and says when the
+// service is left down.
+{
+  const fake = (printsLeft, bootstrapFails) => {
+    const calls = [];
+    const lc = async (args) => {
+      calls.push(args[0]);
+      if (args[0] === "print") return { ok: printsLeft-- > 0 };
+      if (args[0] === "bootstrap") return bootstrapFails-- > 0 ? { ok: false, stderr: "Bootstrap failed: 5: Input/output error", code: 5 } : { ok: true };
+      return { ok: true };
+    };
+    return { lc, calls };
+  };
+  const opts = { domain: "gui/501", plistFile: "/p.plist", wait: async () => {} };
+  let f = fake(2, 1);
+  await launchdReload(f.lc, opts);
+  assert(f.calls.join() === "bootout,print,print,print,bootstrap,bootstrap", "waits for the old job and retries bootstrap, which starts it (RunAtLoad)");
+  const still = async (args) => (args[0] === "bootstrap" ? { ok: false, stderr: "service already bootstrapped" } : { ok: args[0] !== "print" });
+  const seen = [];
+  await launchdReload(async (a) => { seen.push(a[0]); return still(a); }, opts);
+  assert(seen.at(-1) === "kickstart", "a job that stayed loaded is restarted");
+  f = fake(0, 9);
+  let msg = "";
+  try { await launchdReload(f.lc, opts); } catch (e) { msg = e.message; }
+  assert(/not running; start it with: launchctl bootstrap gui\/501 \/p\.plist/.test(msg) && f.calls.filter((c) => c === "bootstrap").length === 5 && !f.calls.includes("kickstart"), "a bootstrap that keeps failing says the service is down and how to start it");
 }
 
 // 4i. Engine permission output: open-computer-use doctor (JSON, or text from older versions) and
