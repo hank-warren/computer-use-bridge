@@ -11,7 +11,7 @@ import { configPath, migrateConfig, normalizeConfig, parseArgs } from "../src/co
 import { plist, stableNode, unit, versionedNode } from "../src/service.mjs";
 import { remoteCommand } from "../src/connect.mjs";
 import { execFileSync } from "node:child_process";
-import { AdError, adKey, adTree } from "../src/engines/agent-desktop.mjs";
+import { AdError, adKey, adSecondary, adTree } from "../src/engines/agent-desktop.mjs";
 import { adPermissions, ocuPermissions } from "../src/engines/install.mjs";
 import { ObuBrowser, cdpKey, pwKey } from "../src/engines/open-browser-use.mjs";
 import { OcuChild, ocuKey, ocuRemap, ocuTypeKeys } from "../src/engines/open-computer-use.mjs";
@@ -326,6 +326,8 @@ switch (args[0]) {
     await s.close();
     assert(read().some((a) => a.join(" ").startsWith("session end cub-")), "the agent-desktop session ends with the bridge session");
     assert(adTree({ app: "X", complete: false, tree: { role: "window" } }).text.includes("Partial tree"), "partial trees are flagged");
+    const listed = adTree({ app: "X", tree: { ref_id: "@s:e1", role: "scrollarea", name: "Edit field", available_actions: ["Click", "Scroll", "SetFocus", "AXShowMenu"] } }).text;
+    assert(/Secondary Actions: SetFocus, AXShowMenu$/m.test(listed) && adSecondary("SetFocus") === "focus" && adSecondary("Scroll") === undefined, "only secondary actions the adapter can perform are listed");
     const off = new AdError({ code: "WINDOW_NOT_FOUND", message: "Application 'Discord' is running but has no matching window", suggestion: "Wait for the app" });
     assert(/current desktop \(Space\)/.test(off.message) && /engineFor/.test(off.message), "a window on another desktop is explained");
     assert(new AdError({ code: "WINDOW_NOT_FOUND", message: "No window with id 7", suggestion: "Run list-windows" }).message.endsWith("(Run list-windows)"), "other window errors keep agent-desktop's suggestion");

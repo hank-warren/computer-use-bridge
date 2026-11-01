@@ -137,9 +137,10 @@ if (runApps) {
 
   const field = Number(/^\s*(\d+) scroll ?area[^\n]*Edit field/m.exec(tree)?.[1]);
   r = keep(await call("scroll", { app, element: field, direction: "down", pages: 1 }));
-  check("scroll the display", !r.isError, r);
+  if (r.isError && /CannotComplete|-25204/.test(r.text)) note("scroll the display", `the app refused it: ${r.text.split("\n")[0].slice(0, 120)}`);
+  else check("scroll the display", !r.isError, r);
   const secondary = /^\s*(\d+) [^\n]*Edit field[^\n]*Secondary Actions: ([^\n]*)/m.exec(tree);
-  const action = secondary?.[2].split(", ").find((a) => /^(Scroll Down|Scroll|SetFocus)$/.test(a));
+  const action = secondary?.[2].split(", ").find((a) => /^(Scroll Down|SetFocus)$/.test(a));
   if (action) {
     r = keep(await call("secondary_action", { app, element: Number(secondary[1]), action }));
     if (r.isError && /AXUIElementPerformAction|ACTION_FAILED|not supported/i.test(r.text)) note(`secondary_action ${action}`, `the app refused it: ${r.text.split("\n")[0].slice(0, 120)}`);

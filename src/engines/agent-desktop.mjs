@@ -40,7 +40,10 @@ export const AD_SECONDARY = {
   expand: "expand", collapse: "collapse", toggle: "toggle", check: "check", uncheck: "uncheck", focus: "focus",
   "scroll-to": "scroll-to", scrollto: "scroll-to", "scroll to visible": "scroll-to", scrolltovisible: "scroll-to",
   "right-click": "right-click", showmenu: "right-click", "show menu": "right-click", clear: "clear",
+  setfocus: "focus",
 };
+// The command for a listed action name, or undefined when this adapter cannot perform it.
+export const adSecondary = (name) => AD_SECONDARY[name.toLowerCase()] ?? AD_SECONDARY[name.toLowerCase().replace(/^ax/, "")];
 
 // agent-desktop's snapshot JSON as an open-computer-use style tree: numbered elements (the ones with
 // refs), one per line, indented by depth, and a closing focus line. Returns the text and the refs.
@@ -60,7 +63,8 @@ export function adTree(data) {
     }
     const states = (n.states ?? []).filter((s) => !["enabled", "visible", "focusable"].includes(s));
     if (num !== null && (n.states ?? []).includes("focused")) focused = num;
-    const actions = (n.available_actions ?? []).filter((x) => x.toLowerCase() !== "click");
+    // Only what secondary_action can do here (agent-desktop also lists e.g. Scroll, which takes a direction).
+    const actions = (n.available_actions ?? []).filter((x) => x.toLowerCase() !== "click" && adSecondary(x));
     let line = `${"\t".repeat(depth)}${num !== null ? `${num} ` : ""}${n.role}`;
     if (states.length) line += ` (${states.join(", ")})`;
     if (n.name) line += ` ${one(n.name)}`;
@@ -198,7 +202,7 @@ export class AdEngine {
       case "set_value": return ["set-value", this.ref(id, a.element_index), a.value];
       case "scroll": return ["scroll", this.ref(id, a.element_index), "--direction", a.direction, "--amount", String(Math.max(1, Math.round(a.pages * 3)))];
       case "perform_secondary_action": {
-        const cmd = AD_SECONDARY[a.action.toLowerCase()] ?? AD_SECONDARY[a.action.toLowerCase().replace(/^ax/, "")];
+        const cmd = adSecondary(a.action);
         if (!cmd) throw new BadInput(`the agent-desktop engine supports these secondary actions: ${[...new Set(Object.values(AD_SECONDARY))].join(", ")}`);
         return [cmd, this.ref(id, a.element_index)];
       }
