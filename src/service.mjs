@@ -2,7 +2,7 @@ import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { NAME, run, writePrivate } from "./common.mjs";
+import { NAME, run, sleep, writePrivate } from "./common.mjs";
 
 // The bridge runs as a per-user service: a LaunchAgent on macOS, a systemd user unit on Linux.
 export const LABEL = "com.hank-warren.computer-use-bridge";
@@ -106,6 +106,24 @@ export function serviceCommand() {
 
 const uid = () => userInfo().uid;
 
+// launchctl bootout returns before the job has unloaded, and a bootstrap meanwhile fails with
+// "5: Input/output error", leaving the service down: wait for the old job to go, and retry.
+// lc runs launchctl with the given arguments.
+export async function launchdReload(lc, { label = LABEL, plistFile = PLIST, domain = `gui/${uid()}`, wait = sleep } = {}) {
+  await lc(["bootout", `${domain}/${label}`]);
+  for (let i = 0; i < 40 && (await lc(["print", `${domain}/${label}`])).ok; i++) await wait(250);
+  const loaded = (r) => r.ok || /already|in progress/i.test(r.stderr ?? "");
+  let r;
+  for (let i = 0; i < 5; i++) {
+    r = await lc(["bootstrap", domain, plistFile]);
+    if (loaded(r)) break;
+    await wait(1000);
+  }
+  if (!loaded(r)) throw new Error(`launchctl bootstrap failed: ${(r.stderr ?? "").trim() || r.code}. The service is not running; start it with: launchctl bootstrap ${domain} ${plistFile}`);
+  // The plist has RunAtLoad, so bootstrap started it; a job that was still loaded needs a restart.
+  if (!r.ok) await lc(["kickstart", "-k", `${domain}/${label}`]);
+}
+
 // Writes the service for this node and config and (re)starts it. extra: more PATH directories
 // (npm's global bin). Returns notes for the user.
 export async function installService(config, extra = []) {
@@ -115,10 +133,7 @@ export async function installService(config, extra = []) {
   if (versionedNode(node)) notes.push(`The service runs ${node}, which belongs to one Node version; after switching versions run "${NAME} setup" again (or "${NAME} update").`);
   if (MAC) {
     writePrivate(PLIST, plist(node, script, config, extra));
-    await run("/bin/launchctl", ["bootout", `gui/${uid()}/${LABEL}`], 15_000);
-    const r = await run("/bin/launchctl", ["bootstrap", `gui/${uid()}`, PLIST], 15_000);
-    if (!r.ok && !/already|in progress/i.test(r.stderr)) throw new Error(`launchctl bootstrap failed: ${r.stderr.trim() || r.code}`);
-    await run("/bin/launchctl", ["kickstart", "-k", `gui/${uid()}/${LABEL}`], 15_000);
+    await launchdReload((args) => run("/bin/launchctl", args, 15_000));
     return notes;
   }
   writePrivate(UNIT, unit(node, script, config, extra));
