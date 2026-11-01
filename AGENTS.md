@@ -37,10 +37,13 @@ The README's "Quick start" is the full procedure; follow it. In short:
      reopen the browser.
    - Linux: `sudo loginctl enable-linger $USER`, so the service survives logout. Ask before using
      sudo.
-5. **Client:** `computer-use-bridge connect <ssh-destination>` registers it with pi.
-   For Claude Code or Codex, use `connect <ssh-destination> --print`, then the README's
-   `claude mcp add` or `codex mcp add` command.
-6. **Verify:** after the user reloads the agent, call `list_apps` and `ping` through the new server.
+5. **Client:** `computer-use-bridge connect <ssh-destination> --name <name>` registers it with pi
+   (without `--name`, the name is the server's hostname). For Claude Code or Codex, use
+   `connect <ssh-destination> --name <name> --print`, then the README's `claude mcp add` or
+   `codex mcp add` command; for Codex, the token's environment variable must be set where Codex
+   starts.
+6. **Verify:** after the user restarts or reloads the agent, call `list_apps` (when apps are on) and
+   `ping` (when tabs are on) through the new server.
 
 Rules while doing this:
 

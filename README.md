@@ -82,25 +82,27 @@ permission or the extension; `status` lists what is left and how to fix it.
 
 ```bash
 npm i -g computer-use-bridge
-computer-use-bridge connect my-mac          # the SSH destination you tested: my-mac, me@100.x.y.z
+computer-use-bridge connect my-mac --name my-mac   # the SSH destination you tested (my-mac, me@100.x.y.z), and a name for it
 ```
 
 `connect` reads the server's address and token over SSH (the token is never printed), saves the
 token to `~/.config/computer-use-bridge/<name>.token` with mode 600 and adds `<name>` to pi's
-`~/.pi/agent/mcp.json`, after a backup. Reload pi and the tools are there.
+`~/.pi/agent/mcp.json`, after a backup. Without `--name`, the name is the server's hostname. Reload
+pi and the tools are there.
 
-For **Claude Code** or **Codex**, run `computer-use-bridge connect my-mac --print` instead: it saves
-the token the same way and prints the server URL (or, for a server on `127.0.0.1`, the SSH command).
-Then, with `my-mac` as the name:
+For **Claude Code** or **Codex**, run `computer-use-bridge connect my-mac --name my-mac --print`
+instead: it saves the token to `~/.config/computer-use-bridge/my-mac.token` the same way and prints
+the server URL (or, for a server on `127.0.0.1`, the SSH command). Then:
 
 ```bash
 # Claude Code, HTTP (Tailscale or LAN)
 claude mcp add --transport http my-mac http://100.x.y.z:47800/mcp \
   --header "Authorization: Bearer $(cat ~/.config/computer-use-bridge/my-mac.token)"
 
-# Codex, HTTP: the token comes from an environment variable Codex can see
+# Codex, HTTP: the token comes from an environment variable set where Codex starts
 codex mcp add my-mac --url http://100.x.y.z:47800/mcp --bearer-token-env-var MY_MAC_BRIDGE_TOKEN
 echo 'export MY_MAC_BRIDGE_TOKEN="$(cat ~/.config/computer-use-bridge/my-mac.token)"' >> ~/.zshrc   # or ~/.bashrc
+export MY_MAC_BRIDGE_TOKEN="$(cat ~/.config/computer-use-bridge/my-mac.token)"   # this shell too; then start codex
 
 # Either, for a server that listens on 127.0.0.1 (stdio over SSH; no token needed). REMOTE is the
 # last string in the "args" that --print shows: a command that finds computer-use-bridge even though
@@ -111,8 +113,9 @@ codex mcp add my-mac -- ssh -T -o BatchMode=yes my-mac "$REMOTE"
 
 ### Check that it works
 
-Ask the agent: "use my-mac's `list_apps` and `ping` tools". `list_apps` should show the apps you
-allowed, and `ping` should answer `pong` when the browser extension is connected.
+Restart or reload the agent, then ask it to use the new server's tools: `list_apps` (when apps are
+on) should show the apps you allowed, and `ping` (when browser tabs are on) should answer `pong`
+once the browser extension is connected.
 
 ## Configuration
 
