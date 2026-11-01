@@ -95,7 +95,8 @@ export class AdEngine {
     this.label = label;
     this.dead = false;
     this.adSession = `cub-${randomUUID().slice(0, 8)}`;
-    this.trees = new Map(); // app id -> { refs, focused } of the latest tree
+    this.trees = new Map(); // app id -> { refs, focused } of the latest tree the client saw
+    this.stale = new Set(); // app ids acted on since that tree (quiet batch steps)
     this.names = new Map(); // bundle id (lowercase) -> display name
     this.queue = Promise.resolve();
   }
@@ -140,10 +141,15 @@ export class AdEngine {
     return ref;
   }
 
+  async read(id) {
+    return adTree(await this.run(["snapshot", "--app", await this.appName(id), "--compact", "--max-depth", String(this.cfg.adMaxDepth ?? 30), "--timeout-ms", String(this.cfg.adTimeoutMs ?? 15_000)]));
+  }
+
+  // Reads the tree the client will see; its element numbers replace the old ones.
   async snapshot(id) {
-    const d = await this.run(["snapshot", "--app", await this.appName(id), "--compact", "--max-depth", String(this.cfg.adMaxDepth ?? 30), "--timeout-ms", String(this.cfg.adTimeoutMs ?? 15_000)]);
-    const t = adTree(d);
+    const t = await this.read(id);
     this.trees.set(id, t);
+    this.stale.delete(id);
     return t.text;
   }
 
@@ -162,9 +168,11 @@ export class AdEngine {
         if (a.mouse_button === "middle") throw new BadInput("the agent-desktop engine cannot middle-click");
         return [a.mouse_button === "right" ? "right-click" : "click", this.ref(id, a.element_index)];
       case "type_text": {
-        const f = this.trees.get(id)?.focused;
-        if (f === null || f === undefined) throw new BadInput("the agent-desktop engine types into the focused element, and the latest tree has none; click a text field first, or use set_value");
-        return ["type", this.ref(id, f), a.text];
+        // After a quiet batch step (e.g. a click into another field) the client's tree predates the
+        // focus change, so read focus afresh, without replacing the numbers later steps use.
+        const t = this.stale.has(id) ? await this.read(id) : this.trees.get(id);
+        if (t?.focused === null || t?.focused === undefined) throw new BadInput("the agent-desktop engine types into the focused element, and the app has none; click a text field first, or use set_value");
+        return ["type", t.refs[t.focused], a.text];
       }
       case "press_key": return ["press", adKey(a.key), "--app", await this.appName(id)];
       case "set_value": return ["set-value", this.ref(id, a.element_index), a.value];
@@ -204,7 +212,8 @@ export class AdEngine {
     }
     const d = await this.run(await this.command(name, a));
     let text = `${name}: ${d.disposition?.delivery ?? "done"}${d.surfaces?.length ? `; open: ${d.surfaces.map((s) => s.kind ?? s.surface ?? s).join(", ")}` : ""}`;
-    if (!opts.quiet) text += `\n${await this.snapshot(a.app)}`;
+    if (opts.quiet) this.stale.add(a.app);
+    else text += `\n${await this.snapshot(a.app)}`;
     const content = [{ type: "text", text }];
     if (opts.image && !opts.quiet) content.push(await this.image(a.app));
     return { content };

@@ -1,4 +1,5 @@
 import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { APPS_SUPPORTED, DEFAULT_CONFIG, HARD_DENY, NAME, expand } from "./common.mjs";
 
 export const APP_ENGINES = ["open-computer-use", "agent-desktop"];
@@ -68,6 +69,9 @@ export function parseArgs(argv) {
   }
   return opts;
 }
+
+// An absolute config path (~ expanded, relative paths against the current directory).
+export const configPath = (p) => resolve(expand(p));
 
 // A reverse tunnel: ssh is a host alias or user@host, as typed after `ssh`.
 export function checkTunnel(t) {

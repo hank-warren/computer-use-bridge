@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface as createPrompt } from "node:readline/promises";
 import { CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, VERSION, expand, lastLine, readJson, run, say, sleep, writePrivate } from "./common.mjs";
-import { APP_ENGINES, BROWSER_IDS, checkTunnel, migrateConfig, normalizeConfig } from "./config.mjs";
+import { APP_ENGINES, BROWSER_IDS, checkTunnel, configPath, migrateConfig, normalizeConfig } from "./config.mjs";
 import { ENGINES, adPermissions, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
 import { binScript, brewServiceInstalled, installService, linger, logHint, serviceCommand, serviceState, stopBrewService } from "./service.mjs";
 
@@ -142,7 +142,8 @@ const parseEngineFor = (s) => Object.fromEntries(parseList(s).map((p) => {
 }));
 
 export async function setup(opts) {
-  const file = expand(opts.config);
+  // Absolute, because the service starts in another working directory.
+  const file = configPath(opts.config);
   const interactive = !opts.yes && process.stdin.isTTY;
   const prompt = () => createPrompt({ input: process.stdin, output: process.stdout });
   let rl = interactive ? prompt() : null;
@@ -354,14 +355,17 @@ export async function setup(opts) {
       await waitFor(() => extensionCheck(norm), "extension connected", 300);
     }
 
-    // The service.
+    // The service, and whether clients can reach it: these count toward the exit status too.
+    const served = [];
     if (opts.service) {
       say(`\nInstalling the service (${MAC ? "LaunchAgent" : "systemd user unit"})...`);
       const npmBin = (await run(npmPath(), ["prefix", "-g"], 15_000)).stdout.trim();
       const notes = await installService(file, npmBin ? [join(npmBin, "bin")] : []);
       for (const n of notes) say(`Note: ${n}`);
       const h = await health(host, port, 15_000);
-      say(h ? `Listening on http://${host}:${port}/mcp (version ${h.version})` : `Not answering on http://${host}:${port} yet; see "${NAME} status" and ${logHint()}`);
+      const svc = await serviceState();
+      served.push(svc.running ? { ok: true, what: `service ${svc.detail}` } : { ok: false, what: `service ${svc.detail}`, fix: `see ${logHint()}` });
+      served.push(h ? { ok: true, what: `server answering on http://${host}:${port}/mcp (version ${h.version})` } : { ok: false, what: `server not answering on http://${host}:${port}`, fix: `see ${logHint()}` });
       if (h && tunnels.length) {
         let states = [];
         for (let i = 0; i < 25; i++) {
@@ -369,13 +373,17 @@ export async function setup(opts) {
           if (states.length && states.every((s) => s.up)) break;
           await sleep(1000);
         }
-        for (const s of states) say(s.up ? `Tunnel to ${s.ssh} is up: port ${s.remotePort} there reaches this server.` : `Tunnel to ${s.ssh} is not up yet: ${s.error}. It keeps retrying; see "${NAME} status".`);
+        for (const t of tunnels) {
+          const s = states.find((x) => x.ssh === t.ssh);
+          served.push(s?.up ? { ok: true, what: `tunnel to ${t.ssh}: port ${t.remotePort} there reaches this server` }
+            : { ok: false, what: `tunnel to ${t.ssh} is not up${s?.error ? `: ${s.error}` : ""}`, fix: `it keeps retrying; check SSH key login to ${t.ssh} and "${NAME} status"` });
+        }
       }
     } else say(`\nNo service installed (--no-service); run "${NAME} serve --config ${file}" under your own supervisor.`);
     if (brewLeft) say(`\nThe Homebrew formula is no longer used; remove it with: brew uninstall ${NAME} && brew untap hank-warren/${NAME}`);
 
     say("\nChecks:");
-    const list = await checks(norm);
+    const list = [...served, ...await checks(norm)];
     printChecks(list);
     const todo = list.filter((c) => !c.ok);
     if (todo.length) {
@@ -446,7 +454,7 @@ export async function update(opts) {
     const err = await npmInstall([`${NAME}@latest`]);
     if (err) throw new Error(`npm failed: ${err}`);
   } else say(`${pkg} is not an npm global install, so it is not upgraded here (git pull a checkout). Refreshing the engines and service...`);
-  const args = [binScript(), "setup", "--yes", "--config", opts.config, ...(opts.service ? [] : ["--no-service"])];
+  const args = [binScript(), "setup", "--yes", "--config", configPath(opts.config), ...(opts.service ? [] : ["--no-service"])];
   return new Promise((resolve) => spawn(process.execPath, args, { stdio: "inherit" }).on("exit", (code) => resolve(code ?? 1)));
 }
 

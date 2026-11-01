@@ -7,11 +7,12 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Session } from "../src/session.mjs";
-import { migrateConfig, normalizeConfig, parseArgs } from "../src/config.mjs";
+import { configPath, migrateConfig, normalizeConfig, parseArgs } from "../src/config.mjs";
 import { plist, stableNode, unit, versionedNode } from "../src/service.mjs";
 import { remoteCommand } from "../src/connect.mjs";
 import { execFileSync } from "node:child_process";
 import { adKey, adTree } from "../src/engines/agent-desktop.mjs";
+import { adPermissions, ocuPermissions } from "../src/engines/install.mjs";
 import { ObuBrowser, cdpKey, pwKey } from "../src/engines/open-browser-use.mjs";
 import { toolDefs, toolSchema } from "../src/tools.mjs";
 
@@ -234,6 +235,7 @@ const fakeBrowser = (cfg, agentIds, cdp = async () => ({})) => {
   const dir = mkdtempSync(join(tmpdir(), "cub-ad-"));
   const calls = join(dir, "calls.jsonl");
   const fake = join(dir, "agent-desktop");
+  const moved = join(dir, "focus-moved");
   // A stand-in CLI: records its arguments and answers with canned envelopes.
   writeFileSync(fake, `#!/usr/bin/env node
 const fs = require("fs");
@@ -245,13 +247,15 @@ const err = (code, message) => { console.log(JSON.stringify({ version: "2.5", ok
 switch (args[0]) {
   case "version": ok({ version: "9.9.9" });
   case "list-apps": ok({ apps: [{ name: "Discord", pid: 1, bundle_id: "com.hnc.Discord", presentation: "foreground" }, { name: "Terminal", pid: 2, bundle_id: "com.apple.Terminal", presentation: "foreground" }, { name: "Helper", pid: 3, bundle_id: "x.helper" }] });
-  case "snapshot": ok({ app: "Discord", window: { title: "general" }, snapshot_id: "s1", complete: true, tree: { role: "window", name: "general", children: [
+  case "snapshot": { const m = fs.existsSync(${JSON.stringify(moved)}); const id = m ? "s2" : "s1"; const r = (n) => "@" + id + ":e" + n;
+    ok({ app: "Discord", window: { title: "general" }, snapshot_id: id, complete: true, tree: { role: "window", name: "general", children: [
     { role: "statictext", name: "hello\\nthere" },
-    { ref_id: "@s1:e1", role: "button", name: "Send", states: ["enabled"], available_actions: ["Click"] },
-    { ref_id: "@s1:e2", role: "textfield", name: "Message", value: "hi", states: ["focused"], available_actions: ["Click", "Focus"] },
-    { ref_id: "@s1:e3", role: "disclosure", name: "Channels", available_actions: ["Expand"], children_count: 4 } ] } });
+    { ref_id: r(1), role: "button", name: "Send", states: ["enabled"], available_actions: ["Click"] },
+    { ref_id: r(2), role: "textfield", name: "Message", value: "hi", states: m ? [] : ["focused"], available_actions: ["Click", "Focus"] },
+    { ref_id: r(3), role: "disclosure", name: "Channels", available_actions: ["Expand"], children_count: 4 },
+    { ref_id: r(4), role: "textfield", name: "Search", states: m ? ["focused"] : [] } ] } }); }
   case "screenshot": ok({ data: "iVBOR", format: "png", width: 10, height: 10 });
-  case "click": if (args[1] === "@s1:e3") err("STALE_REF", "ref no longer matches"); ok({ disposition: { delivery: "delivered_verified", retry: "unsafe" } });
+  case "click": if (args[1] === "@s1:e3") err("STALE_REF", "ref no longer matches"); if (args[1] === "@s1:e4") fs.writeFileSync(${JSON.stringify(moved)}, ""); ok({ disposition: { delivery: "delivered_verified", retry: "unsafe" } });
   default: ok({ disposition: { delivery: "delivered_unverified" } });
 }
 `, { mode: 0o755 });
@@ -306,6 +310,14 @@ switch (args[0]) {
     const plain = await s.callTool("get_state", { app: "com.hnc.Discord" });
     assert(gs.content.some((x) => x.type === "image") && !plain.content.some((x) => x.type === "image") && read().filter((a) => a[0] === "screenshot").length === 1, "screenshots only when asked for");
     assert(adKey("ctrl+shift+Tab") === "ctrl+shift+tab" && adKey("BackSpace") === "delete" && adKey("KP_5") === "5" && adKey("F5") === "f5" && adKey("A") === "A", "xdotool keys map to agent-desktop's");
+    clear();
+    // A click into another field, then typing, in one batch: typing follows the new focus while the
+    // batch's element numbers stay those of the tree the client saw.
+    const fb = await s.callTool("batch", { app: "com.hnc.Discord", actions: [{ action: "click", element: 3 }, { action: "type_text", text: "q" }, { action: "click", element: 0 }] });
+    const fbs = read().filter((a) => a[0] !== "snapshot").map((a) => a.join(" "));
+    assert(!fb.isError && fbs.join("|") === "click @s1:e4|type @s2:e4 q|click @s1:e1", "type_text in a batch follows focus moved by an earlier step");
+    assert(text(fb).includes("The focused UI element is 3."), "the batch returns the tree after its last step");
+    rmSync(moved, { force: true });
     await s.close();
     assert(read().some((a) => a.join(" ").startsWith("session end cub-")), "the agent-desktop session ends with the bridge session");
     assert(adTree({ app: "X", complete: false, tree: { role: "window" } }).text.includes("Partial tree"), "partial trees are flagged");
@@ -334,6 +346,40 @@ switch (args[0]) {
   let out = "";
   try { execFileSync("/bin/sh", ["-c", remoteCommand(["client-info", "--config", "/tmp/it's here.json"])], { env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent" }, stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { out = String(e.stderr); }
   assert(/is not installed there/.test(out), "the remote command runs in sh and reports a missing install");
+}
+
+// 4i. Engine permission output: open-computer-use doctor (JSON, or text from older versions) and
+// agent-desktop's permissions envelope; granted, missing and broken answers.
+{
+  const dir = mkdtempSync(join(tmpdir(), "cub-perm-"));
+  const script = (name, body) => {
+    const f = join(dir, name);
+    writeFileSync(f, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    return f;
+  };
+  try {
+    const ocu = async (body) => ocuPermissions({ ocuCommand: script(`ocu${Math.random()}`, body) });
+    let r = await ocu(`echo '{"accessibilityTrusted":true,"allGranted":true,"missingPermissions":[],"platform":"macos","screenCaptureGranted":true}'`);
+    assert(r.ok && /Accessibility granted, Screen Recording granted/.test(r.what), "doctor --json: granted");
+    r = await ocu(`echo '{"accessibilityTrusted":true,"allGranted":false,"screenCaptureGranted":false}'`);
+    assert(!r.ok && r.human && /Screen Recording missing/.test(r.what), "doctor --json: missing Screen Recording needs a person");
+    r = await ocu(`echo "Permissions: accessibility=granted, screenRecording=missing"`);
+    assert(!r.ok && /Accessibility granted, Screen Recording missing/.test(r.what), "older doctor text output still parses");
+    r = await ocu(`echo "segfault" >&2; exit 3`);
+    assert(!r.ok && !r.human && /doctor failed: segfault/.test(r.what), "an unreadable doctor answer is a failure, not a permission prompt");
+    const ad = async (body) => adPermissions({ adCommand: script(`ad${Math.random()}`, body) });
+    r = await ad(`echo '{"version":"2.5","ok":true,"command":"permissions","data":{"accessibility":{"state":"granted"},"screen_recording":{"state":"granted"}}}'`);
+    assert(r.ok && !r.warn, "agent-desktop: granted");
+    r = await ad(`echo '{"version":"2.5","ok":true,"command":"permissions","data":{"accessibility":{"state":"granted"},"screen_recording":{"state":"denied"}}}'`);
+    assert(r.ok && r.warn, "agent-desktop: no Screen Recording only warns (screenshots)");
+    r = await ad(`echo '{"version":"2.5","ok":true,"command":"permissions","data":{"accessibility":{"state":"denied"},"screen_recording":{"state":"denied"}}}'`);
+    assert(!r.ok && r.human && /Accessibility denied/.test(r.what), "agent-desktop: denied needs a person");
+    r = await ad(`echo "not json"; exit 1`);
+    assert(!r.ok && !r.human && /permissions check failed/.test(r.what), "agent-desktop: an unreadable answer is a failure");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert(configPath("./x.json") === join(process.cwd(), "x.json") && configPath("~/c.json").startsWith("/") && !configPath("~/c.json").includes("~"), "config paths become absolute for the service");
 }
 
 // 5. The tab tree: numbering, flattening and element mapping.
