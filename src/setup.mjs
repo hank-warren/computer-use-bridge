@@ -511,10 +511,14 @@ export async function uninstall(opts) {
   let raw = null;
   try { raw = readJson(file); } catch {}
   const svc = serviceCommand();
-  // Only the service that runs this config; a scratch config leaves the real service alone.
-  const svcText = svc ? readFileSync(svc.file, "utf8") : "";
-  const ownsService = !!svc && (svcText.includes(file) || svcText.includes(file.replace(/&/g, "&amp;")));
-  const files = uninstallFiles(file, raw);
+  // Only the service that runs this config; a scratch config leaves the real service alone, and
+  // its token too when they share one (setup's default token file).
+  const ownsService = !!svc?.config && configPath(svc.config) === file;
+  let keep = null;
+  if (svc?.config && !ownsService) {
+    try { keep = expand(readJson(svc.config).tokenFile); } catch {}
+  }
+  const files = uninstallFiles(file, raw).filter((f) => f !== keep);
   if (!ownsService && !files.length) {
     say(`Nothing to uninstall for ${file}${svc ? ` (the service at ${svc.file} runs another config)` : ""}.`);
     return 0;
@@ -522,7 +526,8 @@ export async function uninstall(opts) {
   say("This removes:");
   if (ownsService) say(`  the service (${svc.file}), stopping it first`);
   for (const f of files) say(`  ${f}`);
-  say("Clients using this server's token stop working; that revokes their access.");
+  if (keep && raw?.tokenFile && expand(raw.tokenFile) === keep) say(`Keeping ${keep}: the installed service (${svc.config}) uses it too.`);
+  else say("Clients using this server's token stop working; that revokes their access.");
   if (!opts.yes) {
     if (!process.stdin.isTTY) throw new Error("uninstall asks before removing anything; pass --yes to run it without a terminal");
     const rl = createPrompt({ input: process.stdin, output: process.stdout });
@@ -534,7 +539,7 @@ export async function uninstall(opts) {
     }
   }
   if (ownsService) {
-    await removeService();
+    await removeService(); // throws, before anything is deleted, if the service keeps running
     say("Stopped and removed the service.");
   }
   for (const f of files) rmSync(f, { force: true });

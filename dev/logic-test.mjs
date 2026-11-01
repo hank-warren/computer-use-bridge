@@ -253,22 +253,53 @@ setInterval(() => {}, 1000);
     try { code = await uninstall({ config: file, yes: true }); } finally { process.stdout.write = write; }
     assert(code === 0 && !existsSync(file) && !existsSync(join(dir, "token")) && existsSync(join(dir, "pikachu.token")), "uninstall --yes removes them and keeps the client token");
     assert(!/the service \(/.test(log.join("")) && /npm rm -g computer-use-bridge/.test(log.join("")), "a service that runs another config is left alone, and what is left is listed");
-    // The service itself, in a throwaway HOME: stopped through launchctl or systemctl, then removed.
+    // The service itself, in a throwaway HOME: stopped through launchctl or systemctl and checked
+    // before anything is removed; a scratch config keeps the token the installed service uses.
     const home = join(dir, "home");
     const svc = execFileSync(process.execPath, ["--input-type=module", "-e", `
 import { mkdirSync, writeFileSync, existsSync } from "node:fs";
-import { dirname } from "node:path";
-const { PLIST, UNIT, removeService } = await import(${JSON.stringify(new URL("../src/service.mjs", import.meta.url).href)});
-const f = process.platform === "darwin" ? PLIST : UNIT;
-mkdirSync(dirname(f), { recursive: true });
-writeFileSync(f, "x");
-const calls = [];
-const removed = await removeService(async (cmd, args) => { calls.push([cmd.split("/").pop(), ...args].join(" ")); return { ok: true }; });
-console.log(JSON.stringify({ removed, gone: !existsSync(f), calls, again: await removeService(async () => ({ ok: true })) }));
+import { dirname, join } from "node:path";
+const S = await import(${JSON.stringify(new URL("../src/service.mjs", import.meta.url).href)});
+const U = await import(${JSON.stringify(new URL("../src/setup.mjs", import.meta.url).href)});
+const mac = process.platform === "darwin";
+const f = mac ? S.PLIST : S.UNIT;
+const home = process.env.HOME;
+const write = (cfg) => { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, mac ? S.plist("/n", "/s", cfg) : S.unit("/n", "/s", cfg)); };
+const out = {};
+// Stops, then removes.
+write(join(home, "live.json"));
+let calls = [];
+const stopped = async (cmd, args) => { calls.push([cmd.split("/").pop(), ...args].join(" ")); return args.includes("print") ? { ok: false } : args.includes("is-active") ? { ok: false, stdout: "inactive\\n" } : { ok: true }; };
+out.removed = await S.removeService(stopped, async () => {});
+out.gone = !existsSync(f);
+out.calls = calls;
+out.again = await S.removeService(stopped);
+// Still running after the stop: throws and leaves the file.
+write(join(home, "live.json"));
+const running = async (cmd, args) => (args.includes("print") ? { ok: true } : args.includes("is-active") ? { ok: true, stdout: "active\\n" } : { ok: false, stderr: "busy", code: 1 });
+try { await S.removeService(running, async () => {}); out.threw = false; } catch (e) { out.threw = /still running/.test(e.message); }
+out.kept = existsSync(f);
+// A scratch config sharing the live service's token file leaves that token alone.
+const token = join(home, "token");
+writeFileSync(token, "t".repeat(64));
+writeFileSync(join(home, "live.json"), JSON.stringify({ tokenFile: token, tabs: { engine: "open-browser-use" } }));
+writeFileSync(join(home, "scratch.json"), JSON.stringify({ tokenFile: token, tabs: { engine: "open-browser-use" } }));
+write(join(home, "live.json"));
+const real = process.stdout.write.bind(process.stdout);
+let said = "";
+process.stdout.write = (x) => { said += x; return true; };
+const code = await U.uninstall({ config: join(home, "scratch.json"), yes: true });
+process.stdout.write = real;
+out.scratch = { code, scratchGone: !existsSync(join(home, "scratch.json")), tokenKept: existsSync(token), serviceKept: existsSync(f), said: /Keeping .*token/.test(said) };
+console.log(JSON.stringify(out));
 `], { env: { ...process.env, HOME: home }, encoding: "utf8" });
-    const r = JSON.parse(svc.trim());
-    const want = process.platform === "darwin" ? [/^launchctl bootout gui\/\d+\/com\.hank-warren\.computer-use-bridge$/] : [/^systemctl --user disable --now computer-use-bridge\.service$/, /^systemctl --user daemon-reload$/];
-    assert(r.removed && r.gone && r.calls.length === want.length && want.every((re, i) => re.test(r.calls[i])) && r.again === false, "removeService stops the service, deletes its file, and is a no-op once it is gone");
+    const r = JSON.parse(svc.trim().split("\n").pop());
+    const want = process.platform === "darwin"
+      ? [/^launchctl bootout gui\/\d+\/com\.hank-warren\.computer-use-bridge$/, /^launchctl print gui\/\d+\/com\.hank-warren\.computer-use-bridge$/]
+      : [/^systemctl --user disable --now computer-use-bridge\.service$/, /^systemctl --user is-active computer-use-bridge\.service$/, /^systemctl --user daemon-reload$/];
+    assert(r.removed && r.gone && r.calls.length === want.length && want.every((re, i) => re.test(r.calls[i])) && r.again === false, "removeService stops the service, checks it stopped, deletes its file, and is a no-op once it is gone");
+    assert(r.threw && r.kept, "a service still running after the stop is reported and left in place, so nothing is deleted");
+    assert(r.scratch.code === 0 && r.scratch.scratchGone && r.scratch.tokenKept && r.scratch.serviceKept && r.scratch.said, "uninstalling a scratch config keeps the token and service of the installed config");
     assert(parseArgs(["uninstall", "--yes"]).yes && parseArgs(["uninstall", "--config", "/x.json"]).config === "/x.json", "uninstall takes --yes and --config");
   } finally {
     rmSync(dir, { recursive: true, force: true });

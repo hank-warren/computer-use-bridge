@@ -89,19 +89,24 @@ WantedBy=default.target
 `;
 }
 
-// The node and script a service file starts, or null.
+// The node, script and config a service file starts, or null.
 export function serviceCommand() {
   const f = MAC ? PLIST : UNIT;
   if (!existsSync(f)) return null;
   const text = readFileSync(f, "utf8");
+  let args;
   if (MAC) {
-    const args = [...text.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1]);
-    const i = args.findIndex((a) => a === LABEL);
-    return { file: f, node: args[i + 1], script: args[i + 2] };
+    const unxml = (s) => s.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+    const all = [...text.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => unxml(m[1]));
+    args = all.slice(all.indexOf(LABEL) + 1);
+  } else {
+    // ExecStart words, bare or double-quoted with backslash escapes (as unit() writes them).
+    const line = /^ExecStart=(.*)$/m.exec(text)?.[1] ?? "";
+    const spec = (s) => s.replace(/%h/g, homedir()).replace(/%u/g, userInfo().username);
+    args = [...line.matchAll(/"((?:[^"\\]|\\.)*)"|(\S+)/g)].map((m) => spec(m[1] !== undefined ? m[1].replace(/\\(.)/g, "$1") : m[2]));
   }
-  const m = /^ExecStart=("([^"]*)"|\S+) ("([^"]*)"|\S+)/m.exec(text);
-  const spec = (s) => s?.replace(/%h/g, homedir()).replace(/%u/g, userInfo().username);
-  return m ? { file: f, node: spec(m[2] ?? m[1]), script: spec(m[4] ?? m[3]) } : { file: f };
+  const c = args.indexOf("--config");
+  return { file: f, node: args[0], script: args[1], config: c >= 0 ? args[c + 1] : undefined };
 }
 
 const uid = () => userInfo().uid;
@@ -148,16 +153,23 @@ export async function installService(config, extra = []) {
   return notes;
 }
 
-// Stops and removes the service. r runs a command like common.mjs's run (tests pass a fake).
-export async function removeService(r = run) {
+// Stops and removes the service, or throws, leaving it in place, if it is still running afterwards
+// (a running server keeps its token in memory). r runs a command like common.mjs's run.
+export async function removeService(r = run, wait = sleep) {
   if (MAC) {
     if (!existsSync(PLIST)) return false;
-    await r("/bin/launchctl", ["bootout", `gui/${uid()}/${LABEL}`], 15_000);
+    const job = `gui/${uid()}/${LABEL}`;
+    const stop = await r("/bin/launchctl", ["bootout", job], 15_000);
+    let loaded = true;
+    for (let i = 0; i < 40 && (loaded = (await r("/bin/launchctl", ["print", job], 10_000)).ok); i++) await wait(250);
+    if (loaded) throw new Error(`the service is still running (launchctl bootout: ${(stop.stderr ?? "").trim() || stop.code}); nothing was removed`);
     rmSync(PLIST, { force: true });
     return true;
   }
   if (!existsSync(UNIT)) return false;
-  await r("systemctl", ["--user", "disable", "--now", `${NAME}.service`], 30_000);
+  const stop = await r("systemctl", ["--user", "disable", "--now", `${NAME}.service`], 30_000);
+  const state = await r("systemctl", ["--user", "is-active", `${NAME}.service`], 10_000);
+  if (/^(active|activating|deactivating|reloading)/.test((state.stdout ?? "").trim())) throw new Error(`the service is still running (systemctl: ${(stop.stderr ?? "").trim() || stop.code}); nothing was removed`);
   rmSync(UNIT, { force: true });
   await r("systemctl", ["--user", "daemon-reload"], 30_000);
   return true;
