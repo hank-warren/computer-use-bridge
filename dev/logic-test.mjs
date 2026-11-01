@@ -269,7 +269,7 @@ const out = {};
 // Stops, then removes.
 write(join(home, "live.json"));
 let calls = [];
-const stopped = async (cmd, args) => { calls.push([cmd.split("/").pop(), ...args].join(" ")); return args.includes("print") ? { ok: false } : args.includes("is-active") ? { ok: false, stdout: "inactive\\n" } : { ok: true }; };
+const stopped = async (cmd, args) => { calls.push([cmd.split("/").pop(), ...args].join(" ")); return args.includes("print") ? { ok: false, code: 113, stderr: "Could not find service" } : args.includes("is-active") ? { ok: false, stdout: "inactive\\n" } : { ok: true }; };
 out.removed = await S.removeService(stopped, async () => {});
 out.gone = !existsSync(f);
 out.calls = calls;
@@ -277,8 +277,12 @@ out.again = await S.removeService(stopped);
 // Still running after the stop: throws and leaves the file.
 write(join(home, "live.json"));
 const running = async (cmd, args) => (args.includes("print") ? { ok: true } : args.includes("is-active") ? { ok: true, stdout: "active\\n" } : { ok: false, stderr: "busy", code: 1 });
-try { await S.removeService(running, async () => {}); out.threw = false; } catch (e) { out.threw = /still running/.test(e.message); }
+try { await S.removeService(running, async () => {}); out.threw = false; } catch (e) { out.threw = /could not confirm/.test(e.message); }
 out.kept = existsSync(f);
+// Unknown state (no user bus, launchctl failing for another reason): also refused.
+const unknown = async (cmd, args) => (args.includes("print") ? { ok: false, code: 5, stderr: "Input/output error" } : { ok: false, code: 1, stdout: "", stderr: "Failed to connect to bus" });
+try { await S.removeService(unknown, async () => {}); out.unknownThrew = false; } catch (e) { out.unknownThrew = /could not confirm/.test(e.message); }
+out.unknownKept = existsSync(f);
 // A scratch config sharing the live service's token file leaves that token alone.
 const token = join(home, "token");
 writeFileSync(token, "t".repeat(64));
@@ -299,6 +303,7 @@ console.log(JSON.stringify(out));
       : [/^systemctl --user disable --now computer-use-bridge\.service$/, /^systemctl --user is-active computer-use-bridge\.service$/, /^systemctl --user daemon-reload$/];
     assert(r.removed && r.gone && r.calls.length === want.length && want.every((re, i) => re.test(r.calls[i])) && r.again === false, "removeService stops the service, checks it stopped, deletes its file, and is a no-op once it is gone");
     assert(r.threw && r.kept, "a service still running after the stop is reported and left in place, so nothing is deleted");
+    assert(r.unknownThrew && r.unknownKept, "a service whose state cannot be read counts as running, so nothing is deleted");
     assert(r.scratch.code === 0 && r.scratch.scratchGone && r.scratch.tokenKept && r.scratch.serviceKept && r.scratch.said, "uninstalling a scratch config keeps the token and service of the installed config");
     assert(parseArgs(["uninstall", "--yes"]).yes && parseArgs(["uninstall", "--config", "/x.json"]).config === "/x.json", "uninstall takes --yes and --config");
   } finally {

@@ -153,23 +153,29 @@ export async function installService(config, extra = []) {
   return notes;
 }
 
-// Stops and removes the service, or throws, leaving it in place, if it is still running afterwards
-// (a running server keeps its token in memory). r runs a command like common.mjs's run.
+// Stops and removes the service, or throws, leaving it in place, unless it is confirmed stopped
+// afterwards (a running server keeps its token in memory, so an unknown state counts as running).
+// r runs a command like common.mjs's run.
 export async function removeService(r = run, wait = sleep) {
   if (MAC) {
     if (!existsSync(PLIST)) return false;
     const job = `gui/${uid()}/${LABEL}`;
     const stop = await r("/bin/launchctl", ["bootout", job], 15_000);
-    let loaded = true;
-    for (let i = 0; i < 40 && (loaded = (await r("/bin/launchctl", ["print", job], 10_000)).ok); i++) await wait(250);
-    if (loaded) throw new Error(`the service is still running (launchctl bootout: ${(stop.stderr ?? "").trim() || stop.code}); nothing was removed`);
+    // launchctl print exits 113 ("Could not find service") once the job is gone; anything else is not proof.
+    let gone = false;
+    for (let i = 0; i < 40; i++) {
+      const p = await r("/bin/launchctl", ["print", job], 10_000);
+      if ((gone = !p.ok && (p.code === 113 || /could not find service/i.test(p.stderr ?? "")))) break;
+      await wait(250);
+    }
+    if (!gone) throw new Error(`could not confirm the service stopped (launchctl bootout: ${(stop.stderr ?? "").trim() || stop.code}); nothing was removed`);
     rmSync(PLIST, { force: true });
     return true;
   }
   if (!existsSync(UNIT)) return false;
   const stop = await r("systemctl", ["--user", "disable", "--now", `${NAME}.service`], 30_000);
-  const state = await r("systemctl", ["--user", "is-active", `${NAME}.service`], 10_000);
-  if (/^(active|activating|deactivating|reloading)/.test((state.stdout ?? "").trim())) throw new Error(`the service is still running (systemctl: ${(stop.stderr ?? "").trim() || stop.code}); nothing was removed`);
+  const state = ((await r("systemctl", ["--user", "is-active", `${NAME}.service`], 10_000)).stdout ?? "").trim();
+  if (state !== "inactive" && state !== "failed") throw new Error(`could not confirm the service stopped (systemctl: ${(stop.stderr ?? "").trim() || stop.code || state || "no answer"}); nothing was removed`);
   rmSync(UNIT, { force: true });
   await r("systemctl", ["--user", "daemon-reload"], 30_000);
   return true;
