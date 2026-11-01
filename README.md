@@ -14,35 +14,58 @@ Agents get each engine's own MCP tools, unchanged, as if it ran on their machine
 | [open-computer-use](https://github.com/iFurySt/open-computer-use) | Apps, through accessibility plus background clicks and keys; also pixel-only apps such as games | macOS |
 | [open-browser-use](https://github.com/iFurySt/open-browser-use) | Browser tabs, through a browser extension | macOS, Linux |
 
+## Do you need the bridge?
+
+- **Your agent runs on the same Mac (or Linux box) as the apps and browser:** you don't. Use the
+  engines directly; they are MCP servers already:
+
+  ```bash
+  npm i -g open-computer-use open-browser-use     # macOS 14+ for open-computer-use
+  open-computer-use doctor                        # grant Accessibility and Screen Recording
+  open-browser-use setup                          # registers the browser host, opens the extension page
+  open-computer-use install-claude-mcp            # or install-codex-mcp; or add `open-computer-use mcp`
+  npx add-mcp "open-browser-use mcp" --name open_browser_use -g -y   # or add `open-browser-use mcp`
+  ```
+
+  See [open-computer-use](https://github.com/iFurySt/open-computer-use) and
+  [open-browser-use](https://github.com/iFurySt/open-browser-use) for details.
+- **Your agent runs on another machine** (a VPS, a VM, another computer): this is what the bridge
+  is for. Read on.
+
 ## Quick start
 
-You need Node 20 or later on both machines. On the machine agents will control:
+### Before you start
+
+- **The machine agents control** (the server): macOS 14 or later for apps, or Linux for browser
+  tabs only; Node 20 or later; Brave or Chrome for tabs.
+- **The machine your agent runs on** (the client): Node 20 or later, and the agent: pi, Claude Code
+  or Codex (or any MCP client).
+- **The client must reach the server.** The simplest way is [Tailscale](https://tailscale.com) on
+  both machines, signed in to the same account.
+- **The client must SSH into the server with a key, without a password prompt.** `connect` uses it
+  once, to fetch the server's address and token. On a Mac server, turn on System Settings > General
+  > Sharing > Remote Login. On the client, `ssh-keygen` if you have no key, then
+  `ssh-copy-id you@server` (use the server's Tailscale name or address), and check that
+  `ssh you@server true` succeeds without asking for a password.
+- **`npm i -g` must work without sudo.** If it fails with `EACCES`, point npm at your home
+  directory instead of using sudo: `npm config set prefix ~/.npm-global` and add
+  `~/.npm-global/bin` to your `PATH` (or install Node with Homebrew or nvm, which need no sudo).
+
+### On the server
 
 ```bash
 npm i -g computer-use-bridge
 computer-use-bridge setup
 ```
 
-`setup` asks whether agents may control apps (macOS) and which ones, which browser to use
-for tabs, and how clients connect (Tailscale recommended). It then installs the engines, writes the
-config, installs a service that starts at login (a LaunchAgent on macOS, a systemd user unit on
-Linux) and checks everything. Two steps need a person at the machine, and `setup` opens and waits
-for them:
+`setup` asks whether agents may control apps (macOS) and which ones, which browser to use for tabs,
+and how clients connect (Tailscale recommended). It then installs the engines, writes the config,
+installs a service that starts at login (a LaunchAgent on macOS, a systemd user unit on Linux) and
+checks everything. Two steps need a person at the machine, and `setup` opens and waits for them:
 
 - **macOS permissions** for open-computer-use: Accessibility and Screen Recording.
 - **The browser extension**: add [Open Browser Use](https://chromewebstore.google.com/detail/open-browser-use/bgjoihaepiejlfjinojjfgokghnodnhd)
   to the browser profile agents should use, then quit and reopen the browser.
-
-On the machine your agent runs on:
-
-```bash
-npm i -g computer-use-bridge
-computer-use-bridge connect my-mac          # any SSH destination: my-mac, me@100.x.y.z
-```
-
-`connect` reads the server's address and token over SSH (the token is never printed), saves the
-token with mode 600 and adds `my-mac` to pi's `~/.pi/agent/mcp.json`, after a backup. `--print`
-shows the configuration and the Claude Code command instead. Reload pi and the tools are there.
 
 Non-interactive, for scripts and agents (see [AGENTS.md](AGENTS.md)):
 
@@ -52,8 +75,44 @@ computer-use-bridge setup --yes --apps open-computer-use --allow com.hnc.Discord
 computer-use-bridge status --json
 ```
 
-`setup` exits 0 when everything works and 3 when a person still has to grant a permission or add
-the extension; `status` lists what is left.
+`setup` exits 0 when everything works and 3 when something still needs attention, often a
+permission or the extension; `status` lists what is left and how to fix it.
+
+### On the client
+
+```bash
+npm i -g computer-use-bridge
+computer-use-bridge connect my-mac          # the SSH destination you tested: my-mac, me@100.x.y.z
+```
+
+`connect` reads the server's address and token over SSH (the token is never printed), saves the
+token to `~/.config/computer-use-bridge/<name>.token` with mode 600 and adds `<name>` to pi's
+`~/.pi/agent/mcp.json`, after a backup. Reload pi and the tools are there.
+
+For **Claude Code** or **Codex**, run `computer-use-bridge connect my-mac --print` instead: it saves
+the token the same way and prints the server URL (or, for a server on `127.0.0.1`, the SSH command).
+Then, with `my-mac` as the name:
+
+```bash
+# Claude Code, HTTP (Tailscale or LAN)
+claude mcp add --transport http my-mac http://100.x.y.z:47800/mcp \
+  --header "Authorization: Bearer $(cat ~/.config/computer-use-bridge/my-mac.token)"
+
+# Codex, HTTP: the token comes from an environment variable Codex can see
+codex mcp add my-mac --url http://100.x.y.z:47800/mcp --bearer-token-env-var MY_MAC_BRIDGE_TOKEN
+echo 'export MY_MAC_BRIDGE_TOKEN="$(cat ~/.config/computer-use-bridge/my-mac.token)"' >> ~/.zshrc   # or ~/.bashrc
+
+# Either, for a server that listens on 127.0.0.1 (stdio over SSH; no token needed). REMOTE is the
+# last string in the "args" that --print shows: a command that finds computer-use-bridge even though
+# a non-interactive SSH session's PATH lacks npm's directory. Pass it as one quoted argument.
+claude mcp add my-mac -- ssh -T -o BatchMode=yes my-mac "$REMOTE"
+codex mcp add my-mac -- ssh -T -o BatchMode=yes my-mac "$REMOTE"
+```
+
+### Check that it works
+
+Ask the agent: "use my-mac's `list_apps` and `ping` tools". `list_apps` should show the apps you
+allowed, and `ping` should answer `pong` when the browser extension is connected.
 
 ## Configuration
 
@@ -131,6 +190,7 @@ release reaches agents after it passes the bridge's live test.
 | `setup` | Configure, install engines and the service, check everything. `--yes` takes defaults; flags: `--apps`, `--allow`, `--tabs`, `--host`, `--port`, `--tunnel`, `--no-service`, `--no-install`. |
 | `status [--json]` | Check the config, engines, permissions, extension, service and server; print fixes. |
 | `update` | `npm i -g computer-use-bridge@latest`, then install that release's tested engine versions and restart the service. |
+| `uninstall [--yes]` | Stop and remove the service, the config and the token (which revokes every client), and list what is left to remove by hand. |
 | `connect HOST` | On a client: add the server at SSH destination `HOST` to pi. `--name`, `--print`, `--pi-config`, `--remote-config`, `--remote-bin`, `--tunnel-name`. |
 | `serve`, `stdio` | Run the HTTP server (what the service runs), or speak MCP on stdin/stdout. |
 
@@ -165,6 +225,17 @@ brew uninstall computer-use-bridge && brew untap hank-warren/computer-use-bridge
 
 `setup` stops the Homebrew service (it holds the same port) and keeps your token, so clients keep
 working.
+
+## Uninstalling
+
+On the server, `computer-use-bridge uninstall` stops and removes the service and deletes the config
+and token. Clients holding the old token can no longer connect. It then lists what is left: the npm
+packages (`npm rm -g computer-use-bridge open-computer-use open-browser-use`), the browser extension,
+the macOS permissions, and each client's entry (pi: `~/.pi/agent/mcp.json`; Claude Code:
+`claude mcp remove <name>`; Codex: `codex mcp remove <name>`) and token file.
+
+To revoke clients without uninstalling, delete the token file and run `computer-use-bridge setup
+--yes`, which makes a new one; then run `connect` again on the clients you keep.
 
 ## Troubleshooting
 

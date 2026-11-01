@@ -21,6 +21,7 @@ On the machine agents control (macOS: apps and browser tabs; Linux: browser tabs
               --yes  --no-service  --no-install
   status    check engines, permissions, extension, service and server [--json]
   update    npm i -g ${NAME}@latest, then refresh engines and the service
+  uninstall stop and remove the service, config and token (asks; --yes skips)
   serve     run the HTTP server (what the service runs)
   stdio     speak MCP on stdin/stdout, e.g. over SSH [--approve-all]
 
@@ -31,9 +32,9 @@ On the client (where pi, Claude Code or Codex runs):
 
   version   print the version
 
-setup, status, update, serve and stdio take --config FILE (default ${DEFAULT_CONFIG}).`;
+setup, status, update, uninstall, serve and stdio take --config FILE (default ${DEFAULT_CONFIG}).`;
 
-const COMMANDS = ["setup", "status", "update", "serve", "stdio", "connect", "client-info", "version", "help"];
+const COMMANDS = ["setup", "status", "update", "uninstall", "serve", "stdio", "connect", "client-info", "version", "help"];
 const FLAGS = {
   setup: { "--apps": "apps", "--allow": "allow", "--tabs": "tabs", "--host": "host", "--port": "port", "--tunnel": "tunnel" },
   connect: { "--name": "name", "--pi-config": "piConfig", "--remote-config": "remoteConfig", "--tunnel-name": "tunnelName", "--remote-bin": "remoteBin" },
@@ -41,6 +42,7 @@ const FLAGS = {
 const SWITCHES = {
   setup: { "--yes": ["yes", true], "-y": ["yes", true], "--no-service": ["service", false], "--no-install": ["install", false] },
   update: { "--no-service": ["service", false] },
+  uninstall: { "--yes": ["yes", true], "-y": ["yes", true] },
   status: { "--json": ["json", true] },
   stdio: { "--approve-all": ["approveAll", true] },
   connect: { "--print": ["print", true] },

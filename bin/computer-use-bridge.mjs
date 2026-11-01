@@ -8,7 +8,7 @@ import { VERSION, log, say } from "../src/common.mjs";
 import { USAGE, loadConfig, parseArgs } from "../src/config.mjs";
 import { clientInfo, connect } from "../src/connect.mjs";
 import { runHttp, runStdio } from "../src/server.mjs";
-import { setup, status, update } from "../src/setup.mjs";
+import { setup, status, uninstall, update } from "../src/setup.mjs";
 
 try {
   const opts = parseArgs(process.argv.slice(2));
@@ -17,6 +17,7 @@ try {
   else if (opts.mode === "setup") process.exit(await setup(opts));
   else if (opts.mode === "status") process.exit(await status(opts));
   else if (opts.mode === "update") process.exit(await update(opts));
+  else if (opts.mode === "uninstall") process.exit(await uninstall(opts));
   else if (opts.mode === "connect") process.exit(await connect(opts));
   else if (opts.mode === "client-info") process.exit(await clientInfo(opts));
   else {

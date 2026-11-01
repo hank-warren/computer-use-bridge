@@ -148,6 +148,21 @@ export async function installService(config, extra = []) {
   return notes;
 }
 
+// Stops and removes the service. r runs a command like common.mjs's run (tests pass a fake).
+export async function removeService(r = run) {
+  if (MAC) {
+    if (!existsSync(PLIST)) return false;
+    await r("/bin/launchctl", ["bootout", `gui/${uid()}/${LABEL}`], 15_000);
+    rmSync(PLIST, { force: true });
+    return true;
+  }
+  if (!existsSync(UNIT)) return false;
+  await r("systemctl", ["--user", "disable", "--now", `${NAME}.service`], 30_000);
+  rmSync(UNIT, { force: true });
+  await r("systemctl", ["--user", "daemon-reload"], 30_000);
+  return true;
+}
+
 export async function restartService() {
   if (MAC) return run("/bin/launchctl", ["kickstart", "-k", `gui/${uid()}/${LABEL}`], 15_000);
   return run("systemctl", ["--user", "restart", `${NAME}.service`], 30_000);

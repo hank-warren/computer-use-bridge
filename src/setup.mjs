@@ -1,14 +1,14 @@
 import { spawn } from "node:child_process";
 import { randomBytes, randomInt } from "node:crypto";
-import { chmodSync, existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync } from "node:fs";
 import { homedir, hostname, networkInterfaces } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface as createPrompt } from "node:readline/promises";
 import { CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, VERSION, expand, lastLine, readJson, run, say, sleep, writePrivate } from "./common.mjs";
 import { APP_ENGINES, BROWSER_IDS, checkTunnel, configPath, migrateConfig, normalizeConfig } from "./config.mjs";
-import { ENGINES, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
-import { binScript, brewServiceInstalled, installService, linger, logHint, serviceCommand, serviceState, stopBrewService } from "./service.mjs";
+import { ENGINES, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifest, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
+import { binScript, brewServiceInstalled, installService, linger, logHint, removeService, serviceCommand, serviceState, stopBrewService } from "./service.mjs";
 
 // ---------- setup, status and update ----------
 
@@ -493,4 +493,58 @@ export async function status(opts) {
     printChecks(report.checks);
   }
   return report.ok ? 0 : 1;
+}
+
+// What uninstall removes for a config: the file, its token and the config's backups. Client token
+// files beside it (connect's <name>.token) stay, since this machine may also be a client.
+export function uninstallFiles(file, raw) {
+  const files = [file];
+  if (raw?.tokenFile) files.push(expand(raw.tokenFile));
+  const dir = dirname(file);
+  const base = file.slice(dir.length + 1);
+  try { for (const n of readdirSync(dir)) if (n.startsWith(`${base}.bak.`)) files.push(join(dir, n)); } catch {}
+  return files.filter((f, i) => existsSync(f) && files.indexOf(f) === i);
+}
+
+export async function uninstall(opts) {
+  const file = configPath(opts.config);
+  let raw = null;
+  try { raw = readJson(file); } catch {}
+  const svc = serviceCommand();
+  // Only the service that runs this config; a scratch config leaves the real service alone.
+  const svcText = svc ? readFileSync(svc.file, "utf8") : "";
+  const ownsService = !!svc && (svcText.includes(file) || svcText.includes(file.replace(/&/g, "&amp;")));
+  const files = uninstallFiles(file, raw);
+  if (!ownsService && !files.length) {
+    say(`Nothing to uninstall for ${file}${svc ? ` (the service at ${svc.file} runs another config)` : ""}.`);
+    return 0;
+  }
+  say("This removes:");
+  if (ownsService) say(`  the service (${svc.file}), stopping it first`);
+  for (const f of files) say(`  ${f}`);
+  say("Clients using this server's token stop working; that revokes their access.");
+  if (!opts.yes) {
+    if (!process.stdin.isTTY) throw new Error("uninstall asks before removing anything; pass --yes to run it without a terminal");
+    const rl = createPrompt({ input: process.stdin, output: process.stdout });
+    const answer = (await rl.question("Remove them? [y/N] ")).trim().toLowerCase();
+    rl.close();
+    if (answer !== "y" && answer !== "yes") {
+      say("Nothing removed.");
+      return 1;
+    }
+  }
+  if (ownsService) {
+    await removeService();
+    say("Stopped and removed the service.");
+  }
+  for (const f of files) rmSync(f, { force: true });
+  try { rmdirSync(dirname(file)); } catch {} // only if now empty
+  say(`Removed ${files.length} file(s).
+
+Left in place (remove them yourself if you no longer want them):
+  - npm packages: npm rm -g ${NAME} open-computer-use open-browser-use
+  - open-browser-use's native host file, if you no longer use open-browser-use directly: ${obuManifest(raw?.tabs?.browser ?? "brave")}
+  - the Open Browser Use extension in your browser${MAC ? "\n  - Accessibility and Screen Recording for Open Computer Use: System Settings > Privacy & Security" : ""}
+  - on each client: its entry (pi: ~/.pi/agent/mcp.json; Claude Code: claude mcp remove <name>; Codex: codex mcp remove <name>) and ~/.config/${NAME}/<name>.token`);
+  return 0;
 }
