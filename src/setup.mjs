@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { createInterface as createPrompt } from "node:readline/promises";
 import { CONFIG_DIR, DEFAULT_CONFIG, DEFAULT_PORT, HARD_DENY, NAME, VERSION, expand, lastLine, readJson, run, say, sleep, writePrivate } from "./common.mjs";
 import { APP_ENGINES, BROWSER_IDS, checkTunnel, configPath, migrateConfig, normalizeConfig } from "./config.mjs";
-import { ENGINES, adPermissions, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
+import { ENGINES, engineCheck, extensionCheck, installedVersion, npmInstall, npmPath, OBU_STORE, obuManifestCheck, ocuOnboard, ocuPermissions, registerObuHost } from "./engines/install.mjs";
 import { binScript, brewServiceInstalled, installService, linger, logHint, serviceCommand, serviceState, stopBrewService } from "./service.mjs";
 
 // ---------- setup, status and update ----------
@@ -95,11 +95,9 @@ export async function checks(cfg) {
   const out = [];
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   out.push(nodeMajor >= 20 ? { ok: true, what: `Node ${process.versions.node} (${process.execPath})` } : { ok: false, what: `Node ${process.versions.node} is too old`, fix: "install Node 20 or later" });
-  for (const name of cfg.appEngines ?? []) {
-    const c = engineCheck(name, cfg);
-    out.push(c);
-    if (!installedVersion(name, cfg)) continue;
-    out.push(name === "agent-desktop" ? await adPermissions(cfg) : await ocuPermissions(cfg));
+  if (cfg.appsOn) {
+    out.push(engineCheck("open-computer-use", cfg));
+    if (installedVersion("open-computer-use", cfg)) out.push(await ocuPermissions(cfg));
   }
   if (cfg.appsOn === false) out.push({ ok: true, what: MAC ? "apps: off" : `apps: off (app control needs macOS; ${process.platform} serves browser tabs)` });
   if (cfg.tabsOn) {
@@ -135,11 +133,6 @@ Server: ${urls.join("; ")}`);
 }
 
 const parseList = (s) => String(s ?? "").split(",").map((x) => x.trim()).filter(Boolean);
-const parseEngineFor = (s) => Object.fromEntries(parseList(s).map((p) => {
-  const [id, engine] = p.split("=");
-  if (!id || !APP_ENGINES.includes(engine)) throw new Error(`--engine-for takes ID=ENGINE pairs with ENGINE ${APP_ENGINES.join(" or ")} (got ${p})`);
-  return [id, engine];
-}));
 
 export async function setup(opts) {
   // Absolute, because the service starts in another working directory.
@@ -200,7 +193,7 @@ export async function setup(opts) {
     }
 
     const { cfg, migrated } = migrateConfig(existsSync(file) ? readJson(file) : {});
-    if (migrated) say("Converting the 0.x config: apps and browser tabs are separate settings now.");
+    if (migrated) say("Converting the config to 2.0: apps run on open-computer-use, and settings of the removed tools and agent-desktop are dropped.");
 
     // What to serve: apps (macOS) and browser tabs.
     let appsEngine = opts.apps ?? cfg.apps?.engine;
@@ -208,9 +201,8 @@ export async function setup(opts) {
       if (opts.apps && opts.apps !== "off") throw new Error(`app control needs macOS; on ${process.platform} use --apps off`);
       appsEngine = "off";
     } else if (opts.apps === undefined) {
-      appsEngine = await choose("Which engine controls apps?", [
-        ["open-computer-use", "open-computer-use: accessibility plus background clicks and keys; also drives pixel-only apps such as games"],
-        ["agent-desktop", "agent-desktop (experimental): accessibility only, with references that never hit the wrong element; its launcher needs Accessibility (see the README)"],
+      appsEngine = await choose("Control apps through open-computer-use?", [
+        ["open-computer-use", "yes: agents may use the apps you allow"],
         ["off", "off: browser tabs only"],
       ], appsEngine ?? "open-computer-use");
     }
@@ -230,7 +222,6 @@ export async function setup(opts) {
     const denied = allow.filter((id) => HARD_DENY.has(id.toLowerCase()));
     if (denied.length) say(`Ignoring always-denied apps: ${denied.join(", ")}`);
     allow = allow.filter((id) => !HARD_DENY.has(id.toLowerCase()));
-    const engineFor = opts.engineFor !== undefined ? parseEngineFor(opts.engineFor) : cfg.apps?.engineFor ?? {};
 
     let tabs = opts.tabs ?? (cfg.tabs ? (cfg.tabs.engine === "off" ? "off" : cfg.tabs.browser ?? "brave") : undefined);
     if (opts.tabs === undefined) {
@@ -310,21 +301,20 @@ export async function setup(opts) {
       }
     }
 
-    // The config file: 1.0 shape, without 0.x keys.
+    // The config file: 2.0 shape, without older keys.
     const out = { ...cfg, host, port, tokenFile };
-    out.apps = { engine: appsEngine, allow, ...(Object.keys(engineFor).length ? { engineFor } : {}) };
+    out.apps = { engine: appsEngine, allow };
     out.tabs = tabs === "off" ? { engine: "off" } : { engine: "open-browser-use", browser: tabs };
     if (tunnels.length) out.tunnels = tunnels;
     else delete out.tunnels;
     for (const k of ["allowApps", "appEngine", "engine", "ocuCommand"]) if (k === "ocuCommand" ? out[k] && !existsSync(expand(out[k])) : true) delete out[k];
     const norm = normalizeConfig(out, { file });
 
-    // Engines: install what is missing (or a different major version) at the tested version.
-    const needed = [...norm.appEngines, ...(norm.tabsOn ? ["open-browser-use"] : [])];
-    const major = (v) => String(v).split(".")[0];
+    // Engines: install the tested version of any that is missing or another version.
+    const needed = [...(norm.appsOn ? ["open-computer-use"] : []), ...(norm.tabsOn ? ["open-browser-use"] : [])];
     const stale = needed.filter((n) => {
       const v = installedVersion(n, norm);
-      return !v || (v !== "unknown" && major(v) !== major(ENGINES[n].pin));
+      return !v || (v !== "unknown" && v !== ENGINES[n].pin);
     });
     if (stale.length && opts.install !== false) {
       const specs = stale.map((n) => `${n}@${ENGINES[n].pin}`);
@@ -343,7 +333,7 @@ export async function setup(opts) {
     say(`Wrote ${file}`);
 
     // Steps only a person can do; interactive setup opens them and waits.
-    if (rl && norm.appEngines.includes("open-computer-use") && installedVersion("open-computer-use", norm) && !(await ocuPermissions(norm)).ok) {
+    if (rl && norm.appsOn && installedVersion("open-computer-use", norm) && !(await ocuPermissions(norm)).ok) {
       say("\nopen-computer-use needs Accessibility and Screen Recording. Opening its setup; grant both to Open Computer Use in System Settings...");
       await ocuOnboard(norm);
       await waitFor(() => ocuPermissions(norm), "permissions granted", 180);
@@ -472,7 +462,7 @@ export async function status(opts) {
     const tokenOk = existsSync(expand(cfg.tokenFile ?? "")) && readFileSync(expand(cfg.tokenFile), "utf8").trim().length >= 32;
     add({ ok: true, what: `config ${file}${migrateConfig(raw).migrated ? ' (0.x format; run "setup" to convert it)' : ""}` });
     add(tokenOk ? { ok: true, what: `token ${cfg.tokenFile}` } : { ok: false, what: `token ${cfg.tokenFile ?? "(none)"} is missing or short`, fix: `run "${NAME} setup"` });
-    report.server = { url: `http://${cfg.host}:${cfg.port}/mcp`, apps: cfg.appsOn ? { engines: cfg.appEngines, allow: cfg.allowApps } : "off", tabs: cfg.tabsOn ? cfg.tabs.browser : "off" };
+    report.server = { url: `http://${cfg.host}:${cfg.port}/mcp`, apps: cfg.appsOn ? { engine: "open-computer-use", allow: cfg.allowApps } : "off", tabs: cfg.tabsOn ? cfg.tabs.browser : "off" };
   } catch (e) {
     add({ ok: false, what: `config: ${e.message}`, fix: `run "${NAME} setup"` });
   }

@@ -4,7 +4,7 @@
 //   node dev/mcp-call.mjs [--out DIR] [--list] [--max CHARS] [--var NAME=REGEX]... CALLS_JSON -- COMMAND [ARGS...]
 //
 // CALLS_JSON is an array of {"name", "arguments"} run in order in one session,
-// e.g. '[{"name":"get_state","arguments":{"app":"com.brave.Browser"}}]'.
+// e.g. '[{"name":"get_app_state","arguments":{"app":"com.brave.Browser"}}]'.
 // Text results are printed; images are written to DIR (default: a temp dir).
 // --var captures REGEX's first group from any result; later calls substitute {{NAME}},
 // or a number for "{{#NAME}}". A {"sleep": MS} entry pauses between calls.
