@@ -7,43 +7,53 @@ control, and the **client**, the machine the agent runs on. Both need Node 20+ a
 
 ## Setting it up for a user
 
-Ask the user before you start: which machine is the server, which apps agents may control (macOS
-bundle IDs; never add apps they did not name), and which browser (`brave` or `chrome`) for tabs.
+The README's "Quick start" is the full procedure; follow it. In short:
 
-On the server:
+1. **Ask first:** where the agent runs, which machine it should control, which apps agents may
+   control (macOS bundle IDs, from `osascript -e 'id of app "Slack"'`; never add apps they did not
+   name), which browser (`brave` or `chrome`), and which agent client (pi, Claude Code, Codex).
+2. **Homebrew install?** If `brew list computer-use-bridge` succeeds, the user has 0.x: follow the
+   README's "Upgrading from Homebrew (0.x)" instead of a fresh install, keeping its token.
+3. **Same machine?** If the agent runs on the machine it controls, do not install the bridge: set up
+   the engines directly (README, "Do you need the bridge?").
+4. **Prerequisites** (README, "Before you start"): Node 20+ on both machines (ask before installing
+   or switching Node), `npm i -g` without sudo (fix `EACCES` with an npm prefix in the home
+   directory, never `sudo npm`), the client reaching the server (Tailscale), and SSH key login from
+   client to server (on a Mac server, Remote Login). Check SSH with
+   `ssh -o BatchMode=yes <server> true` before going on; the user does any step needing a password,
+   sudo or a GUI.
+5. **Server:**
 
-```bash
-node -v                                   # 20 or later; if not, ask before installing or switching Node
-npm i -g computer-use-bridge
-computer-use-bridge setup --yes --apps open-computer-use --allow com.hnc.Discord --tabs brave --host tailscale
-# Linux: --apps off (apps are macOS only)
-computer-use-bridge status --json
-```
+   ```bash
+   npm i -g computer-use-bridge
+   computer-use-bridge setup --yes --apps open-computer-use --allow <ids> --tabs brave --host tailscale
+   # Linux: --apps off (apps are macOS only)
+   computer-use-bridge status --json
+   ```
 
-`setup` installs the engines at their tested versions, writes `~/.config/computer-use-bridge/config.json`,
-installs and starts the service and runs the checks. Exit 0 means ready; exit 3 means a person must
-act, listed under "Needs a person". Only the user can do these; relay them, then re-run
-`status --json` until `ok` is true:
+   Exit 0 means ready; exit 3 means something needs attention. For the items under "Needs a
+   person", relay them to the user, then re-run `status --json` until `ok` is true:
+   - macOS: grant Accessibility and Screen Recording to Open Computer Use
+     (`open-computer-use doctor` opens the prompts).
+   - Add the Open Browser Use extension to the browser profile agents should use, then quit and
+     reopen the browser.
+   - Linux: `sudo loginctl enable-linger $USER`, so the service survives logout. Ask before using
+     sudo.
+6. **Client:** `computer-use-bridge connect <ssh-destination> --name <name>` registers it with pi
+   (without `--name`, the name is the server's hostname). For Claude Code or Codex, use
+   `connect <ssh-destination> --name <name> --print`, then the README's `claude mcp add` or
+   `codex mcp add` command; for Codex, the token's environment variable must be set where Codex
+   starts.
+7. **Verify:** after the user restarts or reloads the agent, call `list_apps` (when apps are on) and
+   `ping` (when tabs are on) through the new server.
 
-- macOS: grant Accessibility and Screen Recording to Open Computer Use (`open-computer-use doctor`
-  opens the prompts).
-- Add the Open Browser Use extension to the browser profile agents should use, then quit and reopen
-  the browser.
-- Linux: `sudo loginctl enable-linger $USER`, so the service survives logout. Ask before using sudo.
+Rules while doing this:
 
-On the client (it must reach the server by SSH key login):
-
-```bash
-npm i -g computer-use-bridge
-computer-use-bridge connect <ssh-destination>      # adds it to ~/.pi/agent/mcp.json (backed up first)
-computer-use-bridge connect <ssh-destination> --print   # Claude Code or other clients
-```
-
-Then the user reloads pi. Rules while doing this:
-
-- Never print, `cat`, echo or paste the token. `connect` moves it over SSH into a mode-600 file.
+- Never print, `cat`, echo or paste the token. `connect` moves it over SSH into a mode-600 file; the
+  README's client commands read it from that file.
 - Do not run any of it with `sudo`, and do not hand-edit the LaunchAgent or systemd unit: run
   `setup --yes` again.
+- To remove it: `computer-use-bridge uninstall` on the server, then remove each client's entry.
 
 ## Working on the code
 

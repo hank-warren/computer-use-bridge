@@ -1,6 +1,6 @@
 {
   "name": "computer-use-bridge",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Serve open-computer-use and open-browser-use's own MCP tools to remote clients (pi, Claude Code, Codex), over Tailscale or SSH with a token and an app allowlist.",
   "keywords": ["mcp", "computer-use", "browser-use", "agent", "open-computer-use", "open-browser-use", "tailscale"],
   "homepage": "https://github.com/hank-warren/computer-use-bridge",

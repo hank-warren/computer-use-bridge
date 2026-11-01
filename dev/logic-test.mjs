@@ -2,7 +2,7 @@
 // Engine-free tests: the native-tool pass-through and its app allowlist (with fake engines and a
 // fake MCP server), config migration, CLI arguments, service files and permission parsing.
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { configPath, migrateConfig, normalizeConfig, parseArgs } from "../src/config.mjs";
@@ -12,6 +12,7 @@ import { McpChild } from "../src/engines/mcp-child.mjs";
 import { obuChild, ocuChild } from "../src/engines/native.mjs";
 import { handle } from "../src/server.mjs";
 import { launchdReload, plist, stableNode, unit, versionedNode } from "../src/service.mjs";
+import { uninstall, uninstallFiles } from "../src/setup.mjs";
 import { Session, parseAppLine } from "../src/session.mjs";
 
 const assert = (c, m) => { if (!c) { console.log("FAIL", m); process.exitCode = 1; } else console.log("ok  ", m); };
@@ -233,6 +234,81 @@ setInterval(() => {}, 1000);
   let out = "";
   try { execFileSync("/bin/sh", ["-c", remoteCommand(["client-info", "--config", "/tmp/it's here.json"])], { env: { PATH: "/usr/bin:/bin", HOME: "/nonexistent" }, stdio: ["ignore", "pipe", "pipe"] }); } catch (e) { out = String(e.stderr); }
   assert(/is not installed there/.test(out), "the remote command runs in sh and reports a missing install");
+}
+
+// 5b. uninstall removes the config, its token and backups, keeps client tokens beside them, and
+// leaves a service that runs another config alone.
+{
+  const dir = mkdtempSync(join(tmpdir(), "cub-un-"));
+  try {
+    const file = join(dir, "config.json");
+    writeFileSync(file, JSON.stringify({ tokenFile: join(dir, "token"), tabs: { engine: "open-browser-use", browser: "brave" } }));
+    for (const n of ["token", "config.json.bak.20260101-000000", "pikachu.token"]) writeFileSync(join(dir, n), "x");
+    const names = uninstallFiles(file, JSON.parse(readFileSync(file, "utf8"))).map((f) => f.slice(dir.length + 1)).sort();
+    assert(same(names, ["config.json", "config.json.bak.20260101-000000", "token"]), "uninstall targets the config, its token and backups, not client tokens");
+    const log = [];
+    const write = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (s) => { log.push(String(s)); return true; };
+    let code;
+    try { code = await uninstall({ config: file, yes: true }); } finally { process.stdout.write = write; }
+    assert(code === 0 && !existsSync(file) && !existsSync(join(dir, "token")) && existsSync(join(dir, "pikachu.token")), "uninstall --yes removes them and keeps the client token");
+    assert(!/the service \(/.test(log.join("")) && /npm rm -g computer-use-bridge/.test(log.join("")), "a service that runs another config is left alone, and what is left is listed");
+    // The service itself, in a throwaway HOME: stopped through launchctl or systemctl and checked
+    // before anything is removed; a scratch config keeps the token the installed service uses.
+    const home = join(dir, "home");
+    const svc = execFileSync(process.execPath, ["--input-type=module", "-e", `
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { dirname, join } from "node:path";
+const S = await import(${JSON.stringify(new URL("../src/service.mjs", import.meta.url).href)});
+const U = await import(${JSON.stringify(new URL("../src/setup.mjs", import.meta.url).href)});
+const mac = process.platform === "darwin";
+const f = mac ? S.PLIST : S.UNIT;
+const home = process.env.HOME;
+const write = (cfg) => { mkdirSync(dirname(f), { recursive: true }); writeFileSync(f, mac ? S.plist("/n", "/s", cfg) : S.unit("/n", "/s", cfg)); };
+const out = {};
+// Stops, then removes.
+write(join(home, "live.json"));
+let calls = [];
+const stopped = async (cmd, args) => { calls.push([cmd.split("/").pop(), ...args].join(" ")); return args.includes("print") ? { ok: false, code: 113, stderr: "Could not find service" } : args.includes("is-active") ? { ok: false, stdout: "inactive\\n" } : { ok: true }; };
+out.removed = await S.removeService(stopped, async () => {});
+out.gone = !existsSync(f);
+out.calls = calls;
+out.again = await S.removeService(stopped);
+// Still running after the stop: throws and leaves the file.
+write(join(home, "live.json"));
+const running = async (cmd, args) => (args.includes("print") ? { ok: true } : args.includes("is-active") ? { ok: true, stdout: "active\\n" } : { ok: false, stderr: "busy", code: 1 });
+try { await S.removeService(running, async () => {}); out.threw = false; } catch (e) { out.threw = /could not confirm/.test(e.message); }
+out.kept = existsSync(f);
+// Unknown state (no user bus, launchctl failing for another reason): also refused.
+const unknown = async (cmd, args) => (args.includes("print") ? { ok: false, code: 5, stderr: "Input/output error" } : { ok: false, code: 1, stdout: "", stderr: "Failed to connect to bus" });
+try { await S.removeService(unknown, async () => {}); out.unknownThrew = false; } catch (e) { out.unknownThrew = /could not confirm/.test(e.message); }
+out.unknownKept = existsSync(f);
+// A scratch config sharing the live service's token file leaves that token alone.
+const token = join(home, "token");
+writeFileSync(token, "t".repeat(64));
+writeFileSync(join(home, "live.json"), JSON.stringify({ tokenFile: token, tabs: { engine: "open-browser-use" } }));
+writeFileSync(join(home, "scratch.json"), JSON.stringify({ tokenFile: token, tabs: { engine: "open-browser-use" } }));
+write(join(home, "live.json"));
+const real = process.stdout.write.bind(process.stdout);
+let said = "";
+process.stdout.write = (x) => { said += x; return true; };
+const code = await U.uninstall({ config: join(home, "scratch.json"), yes: true });
+process.stdout.write = real;
+out.scratch = { code, scratchGone: !existsSync(join(home, "scratch.json")), tokenKept: existsSync(token), serviceKept: existsSync(f), said: /Keeping .*token/.test(said) };
+console.log(JSON.stringify(out));
+`], { env: { ...process.env, HOME: home }, encoding: "utf8" });
+    const r = JSON.parse(svc.trim().split("\n").pop());
+    const want = process.platform === "darwin"
+      ? [/^launchctl bootout gui\/\d+\/com\.hank-warren\.computer-use-bridge$/, /^launchctl print gui\/\d+\/com\.hank-warren\.computer-use-bridge$/]
+      : [/^systemctl --user disable --now computer-use-bridge\.service$/, /^systemctl --user is-active computer-use-bridge\.service$/, /^systemctl --user daemon-reload$/];
+    assert(r.removed && r.gone && r.calls.length === want.length && want.every((re, i) => re.test(r.calls[i])) && r.again === false, "removeService stops the service, checks it stopped, deletes its file, and is a no-op once it is gone");
+    assert(r.threw && r.kept, "a service still running after the stop is reported and left in place, so nothing is deleted");
+    assert(r.unknownThrew && r.unknownKept, "a service whose state cannot be read counts as running, so nothing is deleted");
+    assert(r.scratch.code === 0 && r.scratch.scratchGone && r.scratch.tokenKept && r.scratch.serviceKept && r.scratch.said, "uninstalling a scratch config keeps the token and service of the installed config");
+    assert(parseArgs(["uninstall", "--yes"]).yes && parseArgs(["uninstall", "--config", "/x.json"]).config === "/x.json", "uninstall takes --yes and --config");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 // 6. Reloading the LaunchAgent waits for the old job to unload, retries bootstrap, and says when the
