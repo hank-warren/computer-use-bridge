@@ -91,7 +91,7 @@ const init = await rpc("initialize", { protocolVersion: "2025-06-18", capabiliti
 await rpc("notifications/initialized", {}, true);
 const tools = (await rpc("tools/list", {})).result.tools.map((t) => t.name);
 console.log(`${init.result.serverInfo.name} ${init.result.serverInfo.version}: ${tools.length} tools; images in ${out}`);
-const OCU = ["list_apps", "get_app_state", "click", "type_text", "press_key", "scroll", "set_value", "drag", "perform_secondary_action"];
+const OCU = ["list_apps", "get_app_state", "click", "type_text", "press_key", "scroll", "set_value", "drag", "perform_secondary_action", "query", "select_text"];
 const OBU = ["ping", "info", "tabs", "user_tabs", "open_tab", "claim_tab", "navigate", "wait_load", "page_info", "cdp", "finalize_tabs", "name_session", "turn_ended", "call", "run_action_plan"];
 const first = (r) => r.text.split("\n")[0].slice(0, 160);
 
